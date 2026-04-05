@@ -71,8 +71,9 @@ async def send_long_message(channel: discord.abc.Messageable, text: str) -> None
 
 
 async def handle_chat_message(message: discord.Message, cleaned_content: str, *, is_dm: bool) -> None:
-    if owner_id is not None and message.author.id != owner_id:
-        await message.channel.send("This build is private for Goose right now.")
+    # DMs from non-owner are private
+    if is_dm and owner_id is not None and message.author.id != owner_id:
+        await message.channel.send("DMs are just for Goose. But come say hi in a channel!")
         return
 
     source = "dm" if is_dm else "mention"
@@ -84,7 +85,7 @@ async def handle_chat_message(message: discord.Message, cleaned_content: str, *,
         source=source,
     )
 
-    history = memory.get_recent_messages(channel_id=message.channel.id, limit=10)
+    history = memory.get_recent_messages(channel_id=message.channel.id, limit=20)
     latest_journal = memory.get_latest_journal_entry()
 
     async with message.channel.typing():
