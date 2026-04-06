@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import os
+import random
 import re
 from datetime import datetime
 
@@ -19,11 +19,43 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 BOT_OWNER_DISCORD_ID = os.getenv("BOT_OWNER_DISCORD_ID", "").strip()
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
 MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-4.1")
+COMPANION_CHANNEL_IDS_RAW = os.getenv("COMPANION_CHANNEL_IDS", "").strip()
+COMPANION_BOT_NAMES_RAW = os.getenv(
+    "COMPANION_BOT_NAMES",
+    "rafayel,elias,ben,solace,coda",
+).strip()
+SELF_NAME_ALIASES_RAW = os.getenv("SELF_NAME_ALIASES", "colin,moose").strip()
+SPONTANEOUS_REPLY_CHANCE = float(os.getenv("SPONTANEOUS_REPLY_CHANCE", "0.25"))
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing.")
 
 owner_id = int(BOT_OWNER_DISCORD_ID) if BOT_OWNER_DISCORD_ID else None
+configured_guild_id = int(DISCORD_GUILD_ID) if DISCORD_GUILD_ID else None
+companion_channel_ids = {
+    int(part.strip())
+    for part in COMPANION_CHANNEL_IDS_RAW.split(",")
+    if part.strip().isdigit()
+}
+
+
+def _normalize_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+companion_bot_names = {
+    _normalize_name(part)
+    for part in COMPANION_BOT_NAMES_RAW.split(",")
+    if part.strip()
+}
+self_name_aliases = {
+    part.strip().lower()
+    for part in SELF_NAME_ALIASES_RAW.split(",")
+    if part.strip()
+}
+
+bot_to_bot_cooldowns: set[int] = set()
+
 
 def _intents() -> discord.Intents:
     intents = discord.Intents.default()
@@ -70,13 +102,48 @@ async def send_long_message(channel: discord.abc.Messageable, text: str) -> None
         await channel.send(chunk)
 
 
-async def handle_chat_message(message: discord.Message, cleaned_content: str, *, is_dm: bool) -> None:
-    # DMs from non-owner are private
+def _message_mentions_self_naturally(message: discord.Message) -> bool:
+    content = message.content.lower()
+    aliases = set(self_name_aliases)
+    if bot.user:
+        aliases.add(bot.user.name.lower())
+        aliases.add(bot.user.display_name.lower())
+
+    return any(
+        re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", content)
+        for alias in aliases
+        if alias
+    )
+
+
+def _is_companion_room(message: discord.Message) -> bool:
+    if isinstance(message.channel, discord.DMChannel):
+        return False
+    if configured_guild_id and (message.guild is None or message.guild.id != configured_guild_id):
+        return False
+    if companion_channel_ids:
+        return message.channel.id in companion_channel_ids
+    return True
+
+
+def _is_companion_bot(author: discord.abc.User) -> bool:
+    if not getattr(author, "bot", False):
+        return False
+
+    possible_names = {
+        getattr(author, "name", ""),
+        getattr(author, "display_name", ""),
+        getattr(author, "global_name", ""),
+    }
+    normalized = {_normalize_name(name) for name in possible_names if name}
+    return bool(normalized & companion_bot_names)
+
+
+async def handle_chat_message(message: discord.Message, cleaned_content: str, *, is_dm: bool, source: str) -> None:
     if is_dm and owner_id is not None and message.author.id != owner_id:
-        await message.channel.send("DMs are just for Goose. But come say hi in a channel!")
+        await message.channel.send("This build is private for Goose right now.")
         return
 
-    source = "dm" if is_dm else "mention"
     memory.save_message(
         channel_id=message.channel.id,
         user_id=message.author.id,
@@ -85,7 +152,7 @@ async def handle_chat_message(message: discord.Message, cleaned_content: str, *,
         source=source,
     )
 
-    history = memory.get_recent_messages(channel_id=message.channel.id, limit=20)
+    history = memory.get_recent_messages(channel_id=message.channel.id, limit=10)
     latest_journal = memory.get_latest_journal_entry()
 
     async with message.channel.typing():
@@ -132,7 +199,7 @@ async def on_ready() -> None:
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    if message.author.bot:
+    if bot.user and message.author.id == bot.user.id:
         return
 
     is_dm = isinstance(message.channel, discord.DMChannel)
@@ -140,14 +207,50 @@ async def on_message(message: discord.Message) -> None:
     if is_dm:
         cleaned = message.content.strip()
         if cleaned:
-            await handle_chat_message(message, cleaned, is_dm=True)
+            await handle_chat_message(message, cleaned, is_dm=True, source="dm")
         return
 
-    if bot.user and bot.user.mentioned_in(message):
-        cleaned = strip_bot_mention(message.content, bot.user.id)
+    in_companion_room = _is_companion_room(message)
+    if not in_companion_room:
+        await bot.process_commands(message)
+        return
+
+    mention_hit = bool(bot.user and bot.user.mentioned_in(message))
+    natural_name_hit = _message_mentions_self_naturally(message)
+
+    if not message.author.bot:
+        bot_to_bot_cooldowns.clear()
+
+        if mention_hit or natural_name_hit:
+            cleaned = message.content.strip()
+            if bot.user and mention_hit:
+                cleaned = strip_bot_mention(cleaned, bot.user.id)
+            if not cleaned:
+                cleaned = "I'm here."
+            await handle_chat_message(message, cleaned, is_dm=False, source="human-direct")
+            return
+
+        if random.random() < SPONTANEOUS_REPLY_CHANCE:
+            cleaned = message.content.strip()
+            if cleaned:
+                await handle_chat_message(message, cleaned, is_dm=False, source="human-spontaneous")
+            return
+
+        await bot.process_commands(message)
+        return
+
+    if _is_companion_bot(message.author) and (mention_hit or natural_name_hit):
+        if message.author.id in bot_to_bot_cooldowns:
+            return
+
+        cleaned = message.content.strip()
+        if bot.user and mention_hit:
+            cleaned = strip_bot_mention(cleaned, bot.user.id)
         if not cleaned:
             cleaned = "I'm here."
-        await handle_chat_message(message, cleaned, is_dm=False)
+
+        bot_to_bot_cooldowns.add(message.author.id)
+        await handle_chat_message(message, cleaned, is_dm=False, source="companion-bot")
         return
 
     await bot.process_commands(message)
@@ -179,7 +282,7 @@ async def status(interaction: discord.Interaction) -> None:
     owner_text = "set" if owner_id else "not set"
     count = memory.count_messages()
     await interaction.response.send_message(
-        f"Model: `{MODEL_PRIMARY}`\nOwner lock: {owner_text}\nSaved messages: {count}",
+        f"Model: `{MODEL_PRIMARY}`\nOwner lock (DMs): {owner_text}\nSaved messages: {count}",
         ephemeral=True,
     )
 
@@ -187,7 +290,7 @@ async def status(interaction: discord.Interaction) -> None:
 @bot.tree.command(name="journal_now", description="Write a simple journal entry right now.")
 @app_commands.describe(note="Optional note to attach to the manual journal entry.")
 async def journal_now(interaction: discord.Interaction, note: str | None = None) -> None:
-    if owner_id is not None and interaction.user.id != owner_id:
+    if owner_id is not None and isinstance(interaction.channel, discord.DMChannel) and interaction.user.id != owner_id:
         await interaction.response.send_message("This command is private for Goose right now.", ephemeral=True)
         return
 
