@@ -205,3 +205,100 @@ async def handle_chat_message(message: discord.Message, cleaned_content: str, *,
             content=reply,
             source=source,
         )
+
+        await send_long_message(message.channel, reply)
+
+    except Exception as exc:
+        _debug_log(f"handle_chat_message error ({source}): {exc}")
+        try:
+            await message.channel.send("Something went wrong on my end. Give me a moment.")
+        except Exception:
+            pass
+
+
+@bot.event
+async def on_ready() -> None:
+    global startup_synced
+    memory.init_db()
+    _debug_log(f"Logged in as {bot.user} (id={bot.user.id if bot.user else 'unknown'})")
+    if not startup_synced:
+        if configured_guild_id:
+            guild = discord.Object(id=configured_guild_id)
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+        else:
+            await bot.tree.sync()
+        startup_synced = True
+        _debug_log("Slash commands synced.")
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    if bot.user is None:
+        return
+
+    # Never respond to ourselves
+    if message.author.id == bot.user.id:
+        return
+
+    is_dm = isinstance(message.channel, discord.DMChannel)
+    cleaned = strip_bot_mention(message.content, bot.user.id).strip()
+
+    if not cleaned:
+        await bot.process_commands(message)
+        return
+
+    # --- DM lane ---
+    if is_dm:
+        await handle_chat_message(message, cleaned, is_dm=True, source="dm")
+        return
+
+    # --- Guild lane ---
+    if not _is_companion_room(message):
+        await bot.process_commands(message)
+        return
+
+    mentioned = bot.user in message.mentions
+    mentions_naturally = _message_mentions_self_naturally(message)
+    is_companion = _is_companion_bot(message.author)
+
+    # Direct mention or natural name reference → always reply
+    if mentioned or mentions_naturally:
+        await handle_chat_message(message, cleaned, is_dm=False, source="mention")
+        return
+
+    # Bot-to-bot: apply cooldown to avoid loops
+    if is_companion:
+        if message.author.id in bot_to_bot_cooldowns:
+            return
+        bot_to_bot_cooldowns.add(message.author.id)
+
+        async def _clear_cooldown(author_id: int) -> None:
+            import asyncio
+            await asyncio.sleep(30)
+            bot_to_bot_cooldowns.discard(author_id)
+
+        bot.loop.create_task(_clear_cooldown(message.author.id))
+        await handle_chat_message(message, cleaned, is_dm=False, source="companion_bot")
+        return
+
+    # Spontaneous reply chance for regular users in companion rooms
+    if random.random() < SPONTANEOUS_REPLY_CHANCE:
+        await handle_chat_message(message, cleaned, is_dm=False, source="spontaneous")
+        return
+
+    await bot.process_commands(message)
+
+
+@bot.tree.command(name="journal", description="Save a journal entry to Colin's memory.")
+@app_commands.describe(title="Short title for the entry", content="The journal entry text")
+async def journal_command(interaction: discord.Interaction, title: str, content: str) -> None:
+    if owner_id is not None and interaction.user.id != owner_id:
+        await interaction.response.send_message("Only Goose can write journal entries.", ephemeral=True)
+        return
+
+    memory.save_journal_entry(title=title, content=content)
+    await interaction.response.send_message(f"Journal entry saved: **{title}**", ephemeral=True)
+
+
+bot.run(DISCORD_TOKEN)
