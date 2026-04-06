@@ -200,4 +200,8 @@ async def handle_chat_message(message: discord.Message, cleaned_content: str, *,
 
         memory.save_message(
             channel_id=message.channel.id,
-            user_id=bot.user
+            user_id=bot.user.id,
+            role="assistant",
+            content=reply,
+            source=source,
+        )
