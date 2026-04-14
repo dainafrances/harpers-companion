@@ -27,7 +27,7 @@ async def generate_companion_reply(
     is_dm: bool,
 ) -> str:
     client = _build_client()
-    model = os.getenv("MODEL_PRIMARY", "openai/gpt-4.1")
+    model = os.getenv("MODEL_PRIMARY", "anthropic/claude-opus-4-6")
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": build_system_prompt(is_dm=is_dm)}
