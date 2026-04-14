@@ -43,7 +43,7 @@ async def generate_companion_reply(
     response = await client.chat.completions.create(
         model=model,
         messages=messages,
-        temperature=0.55,
+        temperature=0.60,
     )
 
     text = response.choices[0].message.content or ""
