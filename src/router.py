@@ -19,6 +19,9 @@ def _build_client() -> AsyncOpenAI:
     )
 
 
+_client: AsyncOpenAI = _build_client()
+
+
 async def generate_companion_reply(
     *,
     user_text: str,
@@ -26,7 +29,6 @@ async def generate_companion_reply(
     latest_journal: str | None,
     is_dm: bool,
 ) -> str:
-    client = _build_client()
     model = os.getenv("MODEL_PRIMARY", "anthropic/claude-opus-4-6")
 
     messages: list[dict[str, Any]] = [
@@ -40,7 +42,7 @@ async def generate_companion_reply(
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
 
-    response = await client.chat.completions.create(
+    response = await _client.chat.completions.create(
         model=model,
         messages=messages,
         temperature=0.60,
