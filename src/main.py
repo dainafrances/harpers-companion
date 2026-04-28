@@ -341,8 +341,12 @@ async def on_message(message: discord.Message) -> None:
         await bot.process_commands(message)
         return
 
-    # Mention checks: use mentions list (more reliable than mentioned_in)
+    # Mention checks:
+    # - mention_hit = Colin was directly @mentioned
+    # - everyone_hit = @everyone or @here was used
+    # - natural_name_hit = someone said "Colin" or "Moose" naturally
     mention_hit = bool(bot.user and message.mentions and bot.user in message.mentions)
+    everyone_hit = bool(getattr(message, "mention_everyone", False))
     natural_name_hit = _message_mentions_self_naturally(message)
 
     # HUMAN messages
@@ -350,13 +354,23 @@ async def on_message(message: discord.Message) -> None:
         # any human message resets bot-to-bot cooldowns
         bot_to_bot_cooldowns.clear()
 
-        if mention_hit or natural_name_hit:
+        if mention_hit or everyone_hit or natural_name_hit:
             cleaned = (message.content or "").strip()
+
+            # Remove Colin's direct mention if present
             if bot.user and mention_hit:
                 cleaned = strip_bot_mention(cleaned, bot.user.id)
+
+            # Remove @everyone / @here so Colin doesn't answer as if those words are the message
+            if everyone_hit:
+                cleaned = cleaned.replace("@everyone", "").replace("@here", "").strip()
+
             if not cleaned:
                 cleaned = "I'm here."
-            await handle_chat_message(message, cleaned, is_dm=False, source="human-direct")
+
+            source = "human-everyone" if everyone_hit and not mention_hit and not natural_name_hit else "human-direct"
+
+            await handle_chat_message(message, cleaned, is_dm=False, source=source)
             return
 
         # 25% chance to jump in
@@ -386,7 +400,7 @@ async def on_message(message: discord.Message) -> None:
         return
 
     await bot.process_commands(message)
-
+        
 
 # ----------------------------
 # Heartbeat
