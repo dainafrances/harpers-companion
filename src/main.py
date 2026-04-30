@@ -246,19 +246,42 @@ async def handle_chat_message(message: discord.Message, cleaned_content: str, *,
         header = _speaker_header(message, is_dm=is_dm)
         payload = header + cleaned_content
 
-        # IMPORTANT:
-        # Pull history BEFORE saving the current incoming message,
-        # otherwise the model sees the same user message twice:
-        # once in history and once again as user_text.
+        # Collect image / gif attachments Discord gives us directly
+        image_urls: list[str] = []
+        for attachment in message.attachments:
+            content_type = (attachment.content_type or "").lower()
+            filename = (attachment.filename or "").lower()
+
+            if (
+                content_type.startswith("image/")
+                or filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
+            ):
+                image_urls.append(attachment.url)
+
+        # Optional: pick up image-style embeds too
+        for embed in message.embeds:
+            if getattr(embed, "image", None) and getattr(embed.image, "url", None):
+                image_urls.append(embed.image.url)
+            elif getattr(embed, "thumbnail", None) and getattr(embed.thumbnail, "url", None):
+                image_urls.append(embed.thumbnail.url)
+
+        # De-dupe while preserving order
+        image_urls = list(dict.fromkeys(image_urls))
+
+        # Pull history BEFORE saving current message, so we don't double-send the same turn
         history = memory.get_recent_messages(channel_id=message.channel.id, limit=12)
         latest_journal = memory.get_latest_journal_entry()
 
-        # Save the current user message for future turns / memory
+        # Save current user message for future turns / memory
+        stored_payload = payload
+        if image_urls:
+            stored_payload += f"\n[ATTACHMENTS: {len(image_urls)} image(s)/gif(s)]"
+
         memory.save_message(
             channel_id=message.channel.id,
             user_id=message.author.id,
             role="user",
-            content=payload,
+            content=stored_payload,
             source=source,
         )
 
@@ -268,6 +291,7 @@ async def handle_chat_message(message: discord.Message, cleaned_content: str, *,
                 history=history,
                 latest_journal=latest_journal,
                 is_dm=is_dm,
+                image_urls=image_urls,
             )
 
         # Save assistant reply
@@ -282,11 +306,9 @@ async def handle_chat_message(message: discord.Message, cleaned_content: str, *,
         await send_long_message(message.channel, reply)
 
     except discord.Forbidden:
-        # Permission problem in channel
         _debug_log("ERROR: Missing permissions to speak in this channel.")
     except Exception as e:
         _debug_log(f"ERROR in handle_chat_message: {repr(e)}")
-        # Avoid crashing the bot on one message
         try:
             await message.channel.send("I tripped. Check Railway logs for the error line.")
         except Exception:
