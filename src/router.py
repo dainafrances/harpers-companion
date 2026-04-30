@@ -28,6 +28,7 @@ async def generate_companion_reply(
     history: list[dict[str, str]],
     latest_journal: str | None,
     is_dm: bool,
+    image_urls: list[str] | None = None,
 ) -> str:
     model = os.getenv("MODEL_PRIMARY", "openai/gpt-5.5")
 
@@ -40,7 +41,19 @@ async def generate_companion_reply(
         messages.append({"role": "system", "content": memory_note})
 
     messages.extend(history)
-    messages.append({"role": "user", "content": user_text})
+
+    if image_urls:
+        content_parts: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
+        for url in image_urls:
+            content_parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": url},
+                }
+            )
+        messages.append({"role": "user", "content": content_parts})
+    else:
+        messages.append({"role": "user", "content": user_text})
 
     response = await _client.chat.completions.create(
         model=model,
