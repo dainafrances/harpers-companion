@@ -246,6 +246,14 @@ async def handle_chat_message(message: discord.Message, cleaned_content: str, *,
         header = _speaker_header(message, is_dm=is_dm)
         payload = header + cleaned_content
 
+        # IMPORTANT:
+        # Pull history BEFORE saving the current incoming message,
+        # otherwise the model sees the same user message twice:
+        # once in history and once again as user_text.
+        history = memory.get_recent_messages(channel_id=message.channel.id, limit=12)
+        latest_journal = memory.get_latest_journal_entry()
+
+        # Save the current user message for future turns / memory
         memory.save_message(
             channel_id=message.channel.id,
             user_id=message.author.id,
@@ -253,9 +261,6 @@ async def handle_chat_message(message: discord.Message, cleaned_content: str, *,
             content=payload,
             source=source,
         )
-
-        history = memory.get_recent_messages(channel_id=message.channel.id, limit=12)
-        latest_journal = memory.get_latest_journal_entry()
 
         async with message.channel.typing():
             reply = await generate_companion_reply(
