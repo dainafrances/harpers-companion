@@ -22,7 +22,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 BOT_OWNER_DISCORD_ID = os.getenv("BOT_OWNER_DISCORD_ID", "").strip()
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
 
-MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "anthropic/claude-opus-4-6").strip()
+MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-5.5").strip()
 
 # Comma-separated list of channel IDs allowed for the shared companion room.
 # Example: "123,456"
