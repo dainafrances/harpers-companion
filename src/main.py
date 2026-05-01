@@ -20,23 +20,26 @@ load_dotenv()
 # ----------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 BOT_OWNER_DISCORD_ID = os.getenv("BOT_OWNER_DISCORD_ID", "").strip()
+
+# New multi-guild env var
 DISCORD_GUILD_IDS_RAW = os.getenv("DISCORD_GUILD_IDS", "").strip()
-DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()  # backward compatibility
+
+# Backward compatibility with the old single-guild env var
+DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
+
 MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-5.5").strip()
 
-# Comma-separated list of channel IDs allowed for the shared companion room.
-# Example: "123,456"
+# Optional channel restriction list. Leave blank to allow all channels
+# inside the allowed guild(s).
 COMPANION_CHANNEL_IDS_RAW = os.getenv("COMPANION_CHANNEL_IDS", "").strip()
 
 # Comma-separated list of other companion bot names (display/global/name).
-# Example: "rafayel,elias william ashcombe,ben morgan,solace dante salvatore"
 COMPANION_BOT_NAMES_RAW = os.getenv(
     "COMPANION_BOT_NAMES",
     "rafayel,elias william ashcombe,ben morgan,solace dante salvatore",
 ).strip()
 
 # Comma-separated aliases Colin should respond to if spoken naturally (not @ mention).
-# Example: "colin,moose"
 SELF_NAME_ALIASES_RAW = os.getenv("SELF_NAME_ALIASES", "colin,moose").strip()
 
 # 0.25 = 25% chance to jump in on human messages even without mention
@@ -46,12 +49,11 @@ if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing.")
 
 owner_id = int(BOT_OWNER_DISCORD_ID) if BOT_OWNER_DISCORD_ID else None
-configured_guild_ids = _parse_channel_ids(DISCORD_GUILD_IDS_RAW)
 
-# Backward compatibility: if only the old single-guild env var is set, keep supporting it
-if not configured_guild_ids and DISCORD_GUILD_ID and DISCORD_GUILD_ID.isdigit():
-    configured_guild_ids = {int(DISCORD_GUILD_ID)}
 
+# ----------------------------
+# Helpers / parsing
+# ----------------------------
 def _debug_log(message: str) -> None:
     print(f"[DEBUG] {message}")
 
@@ -67,14 +69,23 @@ def _parse_channel_ids(raw: str) -> set[int]:
     """
     if not raw:
         return set()
+
     parts = re.split(r"[,\s]+", raw.strip())
     out: set[int] = set()
+
     for p in parts:
         p = p.strip()
         if p.isdigit():
             out.add(int(p))
+
     return out
 
+
+configured_guild_ids = _parse_channel_ids(DISCORD_GUILD_IDS_RAW)
+
+# Backward compatibility: if only the old single-guild env var is set, keep supporting it
+if not configured_guild_ids and DISCORD_GUILD_ID and DISCORD_GUILD_ID.isdigit():
+    configured_guild_ids = {int(DISCORD_GUILD_ID)}
 
 companion_channel_ids = _parse_channel_ids(COMPANION_CHANNEL_IDS_RAW)
 
@@ -90,8 +101,9 @@ self_name_aliases = {
     if part.strip()
 }
 
-# cooldown set: store bot author IDs we already responded to (until a human speaks again)
+# Cooldown set: store bot author IDs we already responded to (until a human speaks again)
 bot_to_bot_cooldowns: set[int] = set()
+
 
 # ----------------------------
 # Discord intents / bot setup
@@ -124,6 +136,7 @@ def split_for_discord(text: str, limit: int = 1900) -> list[str]:
 
     chunks: list[str] = []
     current = ""
+
     for paragraph in text.split("\n"):
         candidate = f"{current}\n{paragraph}".strip() if current else paragraph
         if len(candidate) <= limit:
@@ -135,8 +148,10 @@ def split_for_discord(text: str, limit: int = 1900) -> list[str]:
                 chunks.append(paragraph[:limit])
                 paragraph = paragraph[limit:]
             current = paragraph
+
     if current:
         chunks.append(current)
+
     return chunks
 
 
@@ -170,6 +185,7 @@ def _message_mentions_self_naturally(message: discord.Message) -> bool:
             continue
         if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", content):
             return True
+
     return False
 
 
@@ -179,31 +195,21 @@ def _is_companion_room(message: discord.Message) -> bool:
 
     Rules:
     - DMs are handled elsewhere, so this returns False for DMs.
-    - If DISCORD_GUILD_ID is set, only messages from that guild are allowed.
-    - If COMPANION_CHANNEL_IDS is set, those channels are always allowed.
-    - ALSO allow any direct mention of Colin inside the allowed guild,
-      even if the channel wasn't pre-listed (useful for new private channels).
+    - If DISCORD_GUILD_IDS / DISCORD_GUILD_ID is set, only messages from those guilds are allowed.
+    - If COMPANION_CHANNEL_IDS is blank, allow all channels in the allowed guild(s).
     """
     if isinstance(message.channel, discord.DMChannel):
         return False
 
-    if configured_guild_id:
-        if message.guild is None or message.guild.id != configured_guild_id:
+    if configured_guild_ids:
+        if message.guild is None or message.guild.id not in configured_guild_ids:
             return False
 
-    # Explicitly allowed channels always pass
-    if companion_channel_ids and message.channel.id in companion_channel_ids:
-        return True
+    if companion_channel_ids:
+        return message.channel.id in companion_channel_ids
 
-    # If Colin is directly pinged in the home guild, allow it
-    if bot.user and message.mentions and bot.user in message.mentions:
-        return True
+    return True
 
-    # If no channel list is configured, allow all channels in the allowed guild
-    if not companion_channel_ids:
-        return True
-
-    return False
 
 def _is_companion_bot(author: discord.abc.User) -> bool:
     """
@@ -339,14 +345,14 @@ async def on_ready() -> None:
     if not startup_synced:
         try:
             if configured_guild_ids:
-    for guild_id in configured_guild_ids:
-        guild = discord.Object(id=guild_id)
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        print(f"Synced {len(synced)} command(s) to guild {guild_id}.")
-else:
-    synced = await bot.tree.sync()
-    print(f"Synced {len(synced)} global command(s).")
+                for guild_id in configured_guild_ids:
+                    guild = discord.Object(id=guild_id)
+                    bot.tree.copy_global_to(guild=guild)
+                    synced = await bot.tree.sync(guild=guild)
+                    print(f"Synced {len(synced)} command(s) to guild {guild_id}.")
+            else:
+                synced = await bot.tree.sync()
+                print(f"Synced {len(synced)} global command(s).")
         finally:
             startup_synced = True
 
@@ -354,8 +360,11 @@ else:
         nightly_journal.start()
 
     print(f"Logged in as {bot.user} using model {MODEL_PRIMARY}")
-    _debug_log(f"Configured guild lock: {configured_guild_id}")
-    _debug_log(f"Companion channel IDs: {sorted(companion_channel_ids) if companion_channel_ids else 'ALL (within allowed guild)'}")
+    _debug_log(f"Configured guilds: {sorted(configured_guild_ids) if configured_guild_ids else 'ALL GUILDS'}")
+    _debug_log(
+        f"Companion channel IDs: "
+        f"{sorted(companion_channel_ids) if companion_channel_ids else 'ALL CHANNELS (within allowed guilds)'}"
+    )
     _debug_log(f"Owner ID: {owner_id}")
     _debug_log(f"Companion bot names: {sorted(companion_bot_names)}")
     _debug_log(f"Self aliases: {sorted(self_name_aliases)}")
@@ -441,7 +450,7 @@ async def on_message(message: discord.Message) -> None:
         return
 
     await bot.process_commands(message)
-        
+
 
 # ----------------------------
 # Heartbeat
