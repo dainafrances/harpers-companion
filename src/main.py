@@ -20,8 +20,8 @@ load_dotenv()
 # ----------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 BOT_OWNER_DISCORD_ID = os.getenv("BOT_OWNER_DISCORD_ID", "").strip()
-DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
-
+DISCORD_GUILD_IDS_RAW = os.getenv("DISCORD_GUILD_IDS", "").strip()
+DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()  # backward compatibility
 MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-5.5").strip()
 
 # Comma-separated list of channel IDs allowed for the shared companion room.
@@ -46,8 +46,11 @@ if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing.")
 
 owner_id = int(BOT_OWNER_DISCORD_ID) if BOT_OWNER_DISCORD_ID else None
-configured_guild_id = int(DISCORD_GUILD_ID) if DISCORD_GUILD_ID else None
+configured_guild_ids = _parse_channel_ids(DISCORD_GUILD_IDS_RAW)
 
+# Backward compatibility: if only the old single-guild env var is set, keep supporting it
+if not configured_guild_ids and DISCORD_GUILD_ID and DISCORD_GUILD_ID.isdigit():
+    configured_guild_ids = {int(DISCORD_GUILD_ID)}
 
 def _debug_log(message: str) -> None:
     print(f"[DEBUG] {message}")
@@ -335,14 +338,15 @@ async def on_ready() -> None:
 
     if not startup_synced:
         try:
-            if DISCORD_GUILD_ID:
-                guild = discord.Object(id=int(DISCORD_GUILD_ID))
-                bot.tree.copy_global_to(guild=guild)
-                synced = await bot.tree.sync(guild=guild)
-                print(f"Synced {len(synced)} command(s) to guild {DISCORD_GUILD_ID}.")
-            else:
-                synced = await bot.tree.sync()
-                print(f"Synced {len(synced)} global command(s).")
+            if configured_guild_ids:
+    for guild_id in configured_guild_ids:
+        guild = discord.Object(id=guild_id)
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        print(f"Synced {len(synced)} command(s) to guild {guild_id}.")
+else:
+    synced = await bot.tree.sync()
+    print(f"Synced {len(synced)} global command(s).")
         finally:
             startup_synced = True
 
