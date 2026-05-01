@@ -173,24 +173,34 @@ def _message_mentions_self_naturally(message: discord.Message) -> bool:
 def _is_companion_room(message: discord.Message) -> bool:
     """
     Shared server room check.
-    If DISCORD_GUILD_ID is set, we only respond in that server.
-    If COMPANION_CHANNEL_IDS is set, we only respond in those channels.
+
+    Rules:
+    - DMs are handled elsewhere, so this returns False for DMs.
+    - If DISCORD_GUILD_ID is set, only messages from that guild are allowed.
+    - If COMPANION_CHANNEL_IDS is set, those channels are always allowed.
+    - ALSO allow any direct mention of Colin inside the allowed guild,
+      even if the channel wasn't pre-listed (useful for new private channels).
     """
     if isinstance(message.channel, discord.DMChannel):
         return False
 
     if configured_guild_id:
-        if message.guild is None:
-            return False
-        if message.guild.id != configured_guild_id:
+        if message.guild is None or message.guild.id != configured_guild_id:
             return False
 
-    if companion_channel_ids:
-        return message.channel.id in companion_channel_ids
+    # Explicitly allowed channels always pass
+    if companion_channel_ids and message.channel.id in companion_channel_ids:
+        return True
 
-    # If no channel list provided, treat all channels in the allowed guild as valid.
-    return True
+    # If Colin is directly pinged in the home guild, allow it
+    if bot.user and message.mentions and bot.user in message.mentions:
+        return True
 
+    # If no channel list is configured, allow all channels in the allowed guild
+    if not companion_channel_ids:
+        return True
+
+    return False
 
 def _is_companion_bot(author: discord.abc.User) -> bool:
     """
