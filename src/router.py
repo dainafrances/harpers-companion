@@ -3,23 +3,23 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import AsyncAnthropic 
 
 from .identity import build_memory_note, build_system_prompt
 
 
-def _build_client() -> AsyncOpenAI:
+def _build_client() -> AsyncAnthropic:
     api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is missing.")
 
-    return AsyncOpenAI(
+    return AsyncAnthropic(
         api_key=api_key,
         base_url="https://openrouter.ai/api/v1",
     )
 
 
-_client: AsyncOpenAI = _build_client()
+_client: AsyncAnthropic = _build_client()
 
 
 async def generate_companion_reply(
@@ -30,7 +30,7 @@ async def generate_companion_reply(
     is_dm: bool,
     image_urls: list[str] | None = None,
 ) -> str:
-    model = os.getenv("MODEL_PRIMARY", "openai/gpt-5.5")
+    model = os.getenv("MODEL_PRIMARY", "anthropic/claude-opus-4.6")
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": build_system_prompt(is_dm=is_dm)}
