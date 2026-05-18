@@ -27,7 +27,7 @@ DISCORD_GUILD_IDS_RAW = os.getenv("DISCORD_GUILD_IDS", "").strip()
 # Backward compatibility with the old single-guild env var
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
 
-MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-5.5").strip()
+MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "anthropic/claude-opus-4.6").strip()
 
 # Optional channel restriction list. Leave blank to allow all channels
 # inside the allowed guild(s).
@@ -42,8 +42,8 @@ COMPANION_BOT_NAMES_RAW = os.getenv(
 # Comma-separated aliases Colin should respond to if spoken naturally (not @ mention).
 SELF_NAME_ALIASES_RAW = os.getenv("SELF_NAME_ALIASES", "colin,moose").strip()
 
-# 0.25 = 25% chance to jump in on human messages even without mention
-SPONTANEOUS_REPLY_CHANCE = float(os.getenv("SPONTANEOUS_REPLY_CHANCE", "0.25"))
+# 0.0 = 0% chance to jump in on human messages even without mention
+SPONTANEOUS_REPLY_CHANCE = float(os.getenv("SPONTANEOUS_REPLY_CHANCE", "0.0"))
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing.")
@@ -423,7 +423,7 @@ async def on_message(message: discord.Message) -> None:
             await handle_chat_message(message, cleaned, is_dm=False, source=source)
             return
 
-        # 25% chance to jump in
+        # 0% chance to jump in
         if random.random() < SPONTANEOUS_REPLY_CHANCE:
             cleaned = (message.content or "").strip()
             if cleaned:
