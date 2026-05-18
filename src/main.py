@@ -257,6 +257,15 @@ def _speaker_header(message: discord.Message, *, is_dm: bool) -> str:
 # ----------------------------
 async def handle_chat_message(message: discord.Message, cleaned_content: str, *, is_dm: bool, source: str) -> None:
     try:
+        if not memory.try_claim_discord_message(
+            message_id=message.id,
+            channel_id=message.channel.id,
+            author_id=message.author.id,
+            source=source,
+        ):
+            _debug_log(f"Skipping duplicate Discord message {message.id} from source={source}.")
+            return
+
         # Private DM lock stays (only matters in DMs)
         if is_dm and owner_id is not None and message.author.id != owner_id:
             await message.channel.send("This build is private for Goose right now.")
@@ -322,6 +331,11 @@ async def handle_chat_message(message: discord.Message, cleaned_content: str, *,
             source=source,
         )
 
+        chunk_count = len(split_for_discord(reply))
+        _debug_log(
+            f"Sending reply for Discord message {message.id} "
+            f"source={source} length={len(reply)} chunks={chunk_count}."
+        )
         await send_long_message(message.channel, reply)
 
     except discord.Forbidden:
