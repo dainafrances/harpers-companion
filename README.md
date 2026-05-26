@@ -7,6 +7,8 @@ A minimal Discord bot starter for a private, text-first Colin build.
 - replies in DMs
 - replies when mentioned in a server
 - stores simple memory in SQLite
+- ignores duplicate deliveries of the same Discord message
+- adds a short channel cooldown for bot-origin replies to reduce burst fan-out
 - writes a nightly heartbeat journal entry
 - includes slash commands for `/ping`, `/status`, and `/journal_now`
 - uses OpenRouter as the model transport through the OpenAI-compatible client
@@ -35,6 +37,8 @@ You will need:
 - your Discord server ID (`DISCORD_GUILD_ID`) for fast slash-command sync
 - your own Discord user ID (`BOT_OWNER_DISCORD_ID`) if you want the bot locked to you
 - an OpenRouter API key
+- optional: `BOT_REPLY_COOLDOWN_SECONDS` to limit how often Colin replies to bot-origin messages in a channel
+- optional: `MAX_REPLY_TOKENS` to control max model output tokens (default `2500`)
 
 ## Local run (optional)
 

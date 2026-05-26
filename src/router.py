@@ -3,23 +3,31 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from openai import AsyncAnthropic 
+from openai import AsyncOpenAI
 
 from .identity import build_memory_note, build_system_prompt
 
 
-def _build_client() -> AsyncAnthropic:
+def _reply_token_limit() -> int:
+    raw = os.getenv("MAX_REPLY_TOKENS", "2500").strip()
+    try:
+        return max(100, int(raw))
+    except ValueError:
+        return 2500
+
+
+def _build_client() -> AsyncOpenAI:
     api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is missing.")
 
-    return AsyncAnthropic(
+    return AsyncOpenAI(
         api_key=api_key,
         base_url="https://openrouter.ai/api/v1",
     )
 
 
-_client: AsyncAnthropic = _build_client()
+_client: AsyncOpenAI = _build_client()
 
 
 async def generate_companion_reply(
@@ -59,6 +67,7 @@ async def generate_companion_reply(
         model=model,
         messages=messages,
         temperature=0.60,
+        max_tokens=_reply_token_limit(),
     )
 
     text = response.choices[0].message.content or ""
