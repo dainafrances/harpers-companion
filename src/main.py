@@ -44,6 +44,7 @@ SELF_NAME_ALIASES_RAW = os.getenv("SELF_NAME_ALIASES", "colin,moose").strip()
 
 # 0.0 = 0% chance to jump in on human messages even without mention
 SPONTANEOUS_REPLY_CHANCE = float(os.getenv("SPONTANEOUS_REPLY_CHANCE", "0.0"))
+BOT_REPLY_COOLDOWN_SECONDS = max(0, int(os.getenv("BOT_REPLY_COOLDOWN_SECONDS", "12")))
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing.")
@@ -103,6 +104,8 @@ self_name_aliases = {
 
 # Cooldown set: store bot author IDs we already responded to (until a human speaks again)
 bot_to_bot_cooldowns: set[int] = set()
+# Channel-level cooldown for bot-origin replies to avoid burst fan-out
+bot_reply_cooldown_by_channel: dict[int, float] = {}
 
 
 # ----------------------------
@@ -383,6 +386,7 @@ async def on_ready() -> None:
     _debug_log(f"Companion bot names: {sorted(companion_bot_names)}")
     _debug_log(f"Self aliases: {sorted(self_name_aliases)}")
     _debug_log(f"Spontaneous chance: {SPONTANEOUS_REPLY_CHANCE}")
+    _debug_log(f"Bot reply cooldown seconds: {BOT_REPLY_COOLDOWN_SECONDS}")
 
 
 @bot.event
@@ -448,18 +452,39 @@ async def on_message(message: discord.Message) -> None:
         return
 
     # BOT messages (other companion bots)
-    if _is_companion_bot(message.author) and (mention_hit or natural_name_hit):
+    # For bot-origin messages, require direct @mention only (ignore natural-name hits).
+    if _is_companion_bot(message.author) and mention_hit:
         # cooldown: don't answer the same bot twice until a human speaks
         if message.author.id in bot_to_bot_cooldowns:
+            _debug_log(
+                f"[dedupe] skip_bot_message reason=bot_cooldown_active "
+                f"discord_message_id={message.id} author_id={message.author.id}"
+            )
+            return
+
+        # channel-level cooldown so rapid bot chatter doesn't fan out into repeated replies
+        channel_id = message.channel.id
+        now_ts = message.created_at.timestamp()
+        cooldown_until = bot_reply_cooldown_by_channel.get(channel_id, 0.0)
+        if now_ts < cooldown_until:
+            remaining = max(0.0, cooldown_until - now_ts)
+            _debug_log(
+                f"[dedupe] skip_bot_message reason=channel_cooldown "
+                f"discord_message_id={message.id} channel_id={channel_id} remaining_seconds={remaining:.2f}"
+            )
             return
 
         cleaned = (message.content or "").strip()
-        if bot.user and mention_hit:
-            cleaned = strip_bot_mention(cleaned, bot.user.id)
+        cleaned = strip_bot_mention(cleaned, bot.user.id) if bot.user else cleaned
         if not cleaned:
             cleaned = "I'm here."
 
         bot_to_bot_cooldowns.add(message.author.id)
+        bot_reply_cooldown_by_channel[channel_id] = now_ts + BOT_REPLY_COOLDOWN_SECONDS
+        _debug_log(
+            f"[dedupe] accept_bot_message discord_message_id={message.id} "
+            f"channel_id={channel_id} cooldown_seconds={BOT_REPLY_COOLDOWN_SECONDS}"
+        )
         await handle_chat_message(message, cleaned, is_dm=False, source="companion-bot")
         return
 

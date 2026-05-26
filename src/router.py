@@ -8,14 +8,6 @@ from openai import AsyncOpenAI
 from .identity import build_memory_note, build_system_prompt
 
 
-def _reply_token_limit() -> int:
-    raw = os.getenv("MAX_REPLY_TOKENS", "900").strip()
-    try:
-        return max(100, int(raw))
-    except ValueError:
-        return 900
-
-
 def _build_client() -> AsyncOpenAI:
     api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not api_key:
