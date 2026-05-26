@@ -38,6 +38,7 @@ You will need:
 - your own Discord user ID (`BOT_OWNER_DISCORD_ID`) if you want the bot locked to you
 - an OpenRouter API key
 - optional: `BOT_REPLY_COOLDOWN_SECONDS` to limit how often Colin replies to bot-origin messages in a channel
+- optional: `MAX_REPLY_TOKENS` to control max model output tokens (default `2500`)
 
 ## Local run (optional)
 
