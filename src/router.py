@@ -30,7 +30,7 @@ async def generate_companion_reply(
     is_dm: bool,
     image_urls: list[str] | None = None,
 ) -> str:
-    model = os.getenv("MODEL_PRIMARY", "anthropic/claude-opus-4.6")
+    model = os.getenv("MODEL_PRIMARY", "anthropic/claude-opus-4.7")
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": build_system_prompt(is_dm=is_dm)}
@@ -59,6 +59,7 @@ async def generate_companion_reply(
         model=model,
         messages=messages,
         temperature=0.60,
+        max_tokens=_reply_token_limit(),
     )
 
     text = response.choices[0].message.content or ""
