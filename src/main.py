@@ -28,7 +28,7 @@ DISCORD_GUILD_IDS_RAW = os.getenv("DISCORD_GUILD_IDS", "").strip()
 # Backward compatibility with the old single-guild env var
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
 
-MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "anthropic/claude-opus-4.6").strip()
+MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "anthropic/claude-opus-4.7").strip()
 
 # Optional channel restriction list. Leave blank to allow all channels
 # inside the allowed guild(s).
@@ -600,8 +600,7 @@ async def on_message(message: discord.Message) -> None:
             return
 
         cleaned = (message.content or "").strip()
-        if bot.user and mention_hit:
-            cleaned = strip_bot_mention(cleaned, bot.user.id)
+        cleaned = strip_bot_mention(cleaned, bot.user.id) if bot.user else cleaned
         if not cleaned:
             cleaned = "I'm here."
 
