@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Iterable
 
 DB_PATH = Path("data/colin_memory.sqlite3")
 
@@ -34,8 +33,37 @@ def init_db() -> None:
                 content TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS processed_discord_messages (
+                message_id TEXT PRIMARY KEY,
+                channel_id TEXT NOT NULL,
+                author_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
+
+
+def try_claim_discord_message(*, message_id: int, channel_id: int, author_id: int, source: str) -> bool:
+    """
+    Mark an incoming Discord message as handled.
+
+    Returns False if this exact Discord message was already claimed, which protects
+    against duplicate gateway delivery or two handlers racing in the same process.
+    """
+    with connect() as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO processed_discord_messages (message_id, channel_id, author_id, source)
+                VALUES (?, ?, ?, ?)
+                """,
+                (str(message_id), str(channel_id), str(author_id), source),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
 
 
 def save_message(*, channel_id: int, user_id: int, role: str, content: str, source: str) -> None:
