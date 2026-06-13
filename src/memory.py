@@ -81,7 +81,7 @@ def get_recent_messages(*, channel_id: int, limit: int = 12) -> list[dict[str, s
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT role, content
+            SELECT role, content, source
             FROM messages
             WHERE channel_id = ?
             ORDER BY id DESC
@@ -91,7 +91,14 @@ def get_recent_messages(*, channel_id: int, limit: int = 12) -> list[dict[str, s
         ).fetchall()
 
     rows = list(reversed(rows))
-    return [{"role": row["role"], "content": row["content"]} for row in rows]
+    return [
+        {
+            "role": row["role"],
+            "content": row["content"],
+            "source": row["source"],
+        }
+        for row in rows
+    ]
 
 
 def save_journal_entry(*, title: str, content: str) -> None:

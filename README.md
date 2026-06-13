@@ -8,6 +8,7 @@ A minimal Discord bot starter for a private, text-first Colin build.
 - replies when mentioned in a server
 - stores simple memory in SQLite
 - observes permitted channel conversation without replying to every visible message
+- treats observed dialogue as attributed context, not as Colin's identity or writing style
 - allows one controlled reply to each companion bot until a human addresses Colin
 - ignores duplicate deliveries of the same Discord message
 - adds a short channel cooldown for bot-origin replies to reduce burst fan-out

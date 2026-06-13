@@ -423,11 +423,17 @@ async def handle_chat_message(
         )
 
         async with message.channel.typing():
+            speaker_name = (
+                getattr(message.author, "display_name", None)
+                or getattr(message.author, "name", "unknown")
+            )
             reply = await generate_companion_reply(
                 user_text=payload,
                 history=history,
                 latest_journal=latest_journal,
                 is_dm=is_dm,
+                speaker_name=speaker_name,
+                speaker_is_owner=owner_id is not None and message.author.id == owner_id,
                 image_urls=image_urls,
             )
 

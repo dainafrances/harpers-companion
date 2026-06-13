@@ -35,6 +35,16 @@ class FakeChannel:
     async def send(self, content: str, **kwargs) -> None:
         self.sent.append((content, kwargs))
 
+    def typing(self):
+        class TypingContext:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        return TypingContext()
+
 
 class FakeMessage:
     def __init__(
@@ -105,6 +115,22 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         handler.assert_not_awaited()
         self.assertIn("name=Rachael", self.saved_messages()[0]["content"])
         self.assertIn("Room context", self.saved_messages()[0]["content"])
+
+    async def test_normal_reply_path_passes_actual_owner_speaker_metadata(self) -> None:
+        message = FakeMessage(21, self.human, "Hello", channel=self.channel)
+        with (
+            patch.object(main, "owner_id", self.human.id),
+            patch.object(main, "generate_companion_reply", new=AsyncMock(return_value="Hello back")) as generate,
+        ):
+            await main.handle_chat_message(
+                message,
+                "Hello",
+                is_dm=False,
+                source="human-direct",
+            )
+
+        self.assertEqual(generate.await_args.kwargs["speaker_name"], "Daina")
+        self.assertTrue(generate.await_args.kwargs["speaker_is_owner"])
 
     async def test_unaddressed_companion_is_observed_without_reply(self) -> None:
         message = FakeMessage(11, self.ben, "Colin is plain text only", channel=self.channel)
