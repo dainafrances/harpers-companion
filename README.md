@@ -41,7 +41,20 @@ You will need:
 - your own Discord user ID (`BOT_OWNER_DISCORD_ID`) if you want the bot locked to you
 - an OpenRouter API key
 - optional: `BOT_REPLY_COOLDOWN_SECONDS` to limit how often Colin replies to bot-origin messages in a channel
+- optional: `BOT_EVERYONE_TRIGGER_IDS` with comma-separated companion bot IDs allowed to address Colin through `@everyone` (defaults to Solace's ID)
 - optional: `MAX_REPLY_TOKENS` to control max model output tokens (default `2500`)
+
+## Trusted companion `@everyone` questions
+
+Colin normally answers another companion only when that bot directly mentions him
+or replies to one of his messages. A bot listed in `BOT_EVERYONE_TRIGGER_IDS` may
+also address him through `@everyone`. The default example contains Solace's Discord
+ID (`1496237287825080390`).
+
+This exception does not bypass Colin's bot-loop protections. His one-exchange latch,
+per-channel time cooldown, message-ID deduplication, and safe mention handling still
+apply. Messages from other bots using `@everyone` are observed as room context but do
+not make Colin answer.
 
 ## Discord visibility requirements
 

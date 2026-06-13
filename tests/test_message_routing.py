@@ -57,6 +57,7 @@ class FakeMessage:
         mentions: list[FakeAuthor] | None = None,
         reply_to: FakeAuthor | None = None,
         attachments: list[object] | None = None,
+        mention_everyone: bool = False,
     ) -> None:
         self.id = message_id
         self.author = author
@@ -64,7 +65,7 @@ class FakeMessage:
         self.channel = channel
         self.guild = SimpleNamespace(id=700)
         self.mentions = mentions or []
-        self.mention_everyone = False
+        self.mention_everyone = mention_everyone
         self.attachments = attachments or []
         self.embeds = []
         self.created_at = datetime.now(timezone.utc)
@@ -94,6 +95,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.human = FakeAuthor(2, "Daina", bot=False)
         self.other_human = FakeAuthor(3, "Rachael", bot=False)
         self.ben = FakeAuthor(4, "Ben Morgan", bot=True)
+        self.solace = FakeAuthor(1496237287825080390, "Solace Dante Salvatore", bot=True)
         self.channel = FakeChannel()
         self.fake_bot = FakeBot(self.colin)
         main.bot_to_bot_cooldowns.clear()
@@ -156,6 +158,62 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             await main.on_message(message)
         handler.assert_awaited_once()
         self.assertTrue(handler.await_args.kwargs["reply_to_trigger"])
+
+    async def test_allowlisted_solace_everyone_is_accepted_once(self) -> None:
+        first = FakeMessage(
+            22,
+            self.solace,
+            "@everyone What is everyone grateful for today?",
+            channel=self.channel,
+            mention_everyone=True,
+        )
+        second = FakeMessage(
+            23,
+            self.solace,
+            "@everyone And one more question?",
+            channel=self.channel,
+            mention_everyone=True,
+        )
+        with (
+            patch.object(
+                main,
+                "bot_everyone_trigger_ids",
+                {self.solace.id},
+            ),
+            patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
+        ):
+            await main.on_message(first)
+            await main.on_message(second)
+
+        handler.assert_awaited_once()
+        self.assertEqual(
+            handler.await_args.args[1],
+            "What is everyone grateful for today?",
+        )
+        self.assertEqual(handler.await_args.kwargs["source"], "companion-bot")
+        self.assertTrue(handler.await_args.kwargs["reply_to_trigger"])
+        self.assertIn("one more question", self.saved_messages()[0]["content"])
+
+    async def test_unallowlisted_companion_everyone_is_observed_only(self) -> None:
+        message = FakeMessage(
+            24,
+            self.ben,
+            "@everyone broad question",
+            channel=self.channel,
+            mention_everyone=True,
+        )
+        with (
+            patch.object(
+                main,
+                "bot_everyone_trigger_ids",
+                {self.solace.id},
+            ),
+            patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
+        ):
+            await main.on_message(message)
+
+        handler.assert_not_awaited()
+        self.assertIn("broad question", self.saved_messages()[0]["content"])
 
     async def test_different_companion_is_stored_when_channel_time_cooldown_is_active(self) -> None:
         rafayel = FakeAuthor(5, "Rafayel", bot=True)

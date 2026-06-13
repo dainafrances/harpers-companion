@@ -40,6 +40,14 @@ COMPANION_BOT_NAMES_RAW = os.getenv(
     "rafayel,elias william ashcombe,ben morgan,solace dante salvatore",
 ).strip()
 
+# Bot IDs permitted to address Colin with @everyone. This is deliberately
+# separate from companion names so an unrelated bot cannot trigger him by
+# adopting a familiar display name.
+BOT_EVERYONE_TRIGGER_IDS_RAW = os.getenv(
+    "BOT_EVERYONE_TRIGGER_IDS",
+    "1496237287825080390",
+).strip()
+
 # Comma-separated aliases Colin should respond to if spoken naturally (not @ mention).
 SELF_NAME_ALIASES_RAW = os.getenv("SELF_NAME_ALIASES", "colin,moose").strip()
 
@@ -90,6 +98,7 @@ if not configured_guild_ids and DISCORD_GUILD_ID and DISCORD_GUILD_ID.isdigit():
     configured_guild_ids = {int(DISCORD_GUILD_ID)}
 
 companion_channel_ids = _parse_channel_ids(COMPANION_CHANNEL_IDS_RAW)
+bot_everyone_trigger_ids = _parse_channel_ids(BOT_EVERYONE_TRIGGER_IDS_RAW)
 
 companion_bot_names = {
     _normalize_name(part)
@@ -500,6 +509,7 @@ async def on_ready() -> None:
     )
     _debug_log(f"Owner ID: {owner_id}")
     _debug_log(f"Companion bot names: {sorted(companion_bot_names)}")
+    _debug_log(f"Bot @everyone trigger IDs: {sorted(bot_everyone_trigger_ids)}")
     _debug_log(f"Self aliases: {sorted(self_name_aliases)}")
     _debug_log(f"Spontaneous chance: {SPONTANEOUS_REPLY_CHANCE}")
     _debug_log(f"Bot reply cooldown seconds: {BOT_REPLY_COOLDOWN_SECONDS}")
@@ -577,9 +587,13 @@ async def on_message(message: discord.Message) -> None:
         await bot.process_commands(message)
         return
 
-    # COMPANION BOT messages: direct @mention or Discord reply to Colin only.
+    # COMPANION BOT messages: direct @mention, Discord reply to Colin, or an
+    # @everyone from a specifically allowlisted companion bot.
     if _is_companion_bot(message.author):
-        companion_trigger = mention_hit or reply_to_self
+        trusted_everyone_hit = (
+            everyone_hit and message.author.id in bot_everyone_trigger_ids
+        )
+        companion_trigger = mention_hit or reply_to_self or trusted_everyone_hit
         if not companion_trigger:
             save_observed_message(message, source="observed-companion-bot")
             return
@@ -606,7 +620,10 @@ async def on_message(message: discord.Message) -> None:
             return
 
         cleaned = (message.content or "").strip()
-        cleaned = strip_bot_mention(cleaned, bot.user.id) if bot.user else cleaned
+        if bot.user and mention_hit:
+            cleaned = strip_bot_mention(cleaned, bot.user.id)
+        if trusted_everyone_hit:
+            cleaned = cleaned.replace("@everyone", "").replace("@here", "").strip()
         if not cleaned:
             cleaned = "I'm here."
 
@@ -615,7 +632,8 @@ async def on_message(message: discord.Message) -> None:
         bot_reply_cooldown_by_channel[channel_id] = now_ts + BOT_REPLY_COOLDOWN_SECONDS
         _debug_log(
             f"Companion trigger accepted discord_message_id={message.id} "
-            f"author_id={message.author.id} channel_id={channel_id}."
+            f"author_id={message.author.id} channel_id={channel_id} "
+            f"trigger={'trusted-everyone' if trusted_everyone_hit else 'direct'}."
         )
         await handle_chat_message(
             message,
