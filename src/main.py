@@ -48,6 +48,14 @@ BOT_EVERYONE_TRIGGER_IDS_RAW = os.getenv(
     "1496237287825080390",
 ).strip()
 
+# Solace gets an explicit ID-first route because Discord display names can
+# change without warning. Keep the broader ID list above for future trusted
+# companions, but do not require Solace's current display name to match it.
+SOLACE_DISCORD_USER_ID_RAW = os.getenv(
+    "SOLACE_DISCORD_USER_ID",
+    "1496237287825080390",
+).strip()
+
 # Comma-separated aliases Colin should respond to if spoken naturally (not @ mention).
 SELF_NAME_ALIASES_RAW = os.getenv("SELF_NAME_ALIASES", "colin,moose").strip()
 
@@ -99,6 +107,11 @@ if not configured_guild_ids and DISCORD_GUILD_ID and DISCORD_GUILD_ID.isdigit():
 
 companion_channel_ids = _parse_channel_ids(COMPANION_CHANNEL_IDS_RAW)
 bot_everyone_trigger_ids = _parse_channel_ids(BOT_EVERYONE_TRIGGER_IDS_RAW)
+solace_discord_user_id = (
+    int(SOLACE_DISCORD_USER_ID_RAW)
+    if SOLACE_DISCORD_USER_ID_RAW.isdigit()
+    else 1496237287825080390
+)
 
 companion_bot_names = {
     _normalize_name(part)
@@ -510,6 +523,7 @@ async def on_ready() -> None:
     _debug_log(f"Owner ID: {owner_id}")
     _debug_log(f"Companion bot names: {sorted(companion_bot_names)}")
     _debug_log(f"Bot @everyone trigger IDs: {sorted(bot_everyone_trigger_ids)}")
+    _debug_log(f"Solace Discord user ID: {solace_discord_user_id}")
     _debug_log(f"Self aliases: {sorted(self_name_aliases)}")
     _debug_log(f"Spontaneous chance: {SPONTANEOUS_REPLY_CHANCE}")
     _debug_log(f"Bot reply cooldown seconds: {BOT_REPLY_COOLDOWN_SECONDS}")
@@ -543,6 +557,8 @@ async def on_message(message: discord.Message) -> None:
 
     mention_hit = bool(bot.user and message.mentions and bot.user in message.mentions)
     everyone_hit = bool(getattr(message, "mention_everyone", False))
+    raw_content = (message.content or "").lower()
+    bot_broadcast_text_hit = "@everyone" in raw_content or "@here" in raw_content
     natural_name_hit = _message_mentions_self_naturally(message)
     reply_to_self = await _message_replies_to_self(message)
 
@@ -589,9 +605,15 @@ async def on_message(message: discord.Message) -> None:
 
     # COMPANION BOT messages: direct @mention, Discord reply to Colin, or an
     # @everyone from a specifically allowlisted companion bot.
-    if _is_companion_bot(message.author):
+    is_solace = message.author.id == solace_discord_user_id
+    trusted_broadcast_bot = (
+        is_solace or message.author.id in bot_everyone_trigger_ids
+    )
+    is_known_companion = _is_companion_bot(message.author) or trusted_broadcast_bot
+
+    if is_known_companion:
         trusted_everyone_hit = (
-            everyone_hit and message.author.id in bot_everyone_trigger_ids
+            trusted_broadcast_bot and (everyone_hit or bot_broadcast_text_hit)
         )
         companion_trigger = mention_hit or reply_to_self or trusted_everyone_hit
         if not companion_trigger:
@@ -639,7 +661,11 @@ async def on_message(message: discord.Message) -> None:
             message,
             cleaned,
             is_dm=False,
-            source="companion-bot",
+            source=(
+                "solace-mention-everyone"
+                if is_solace and trusted_everyone_hit
+                else "companion-bot"
+            ),
             reply_to_trigger=True,
         )
         return

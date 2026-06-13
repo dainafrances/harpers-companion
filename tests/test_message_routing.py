@@ -95,7 +95,9 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.human = FakeAuthor(2, "Daina", bot=False)
         self.other_human = FakeAuthor(3, "Rachael", bot=False)
         self.ben = FakeAuthor(4, "Ben Morgan", bot=True)
-        self.solace = FakeAuthor(1496237287825080390, "Solace Dante Salvatore", bot=True)
+        # Deliberately does not match Colin's configured full-name alias. Solace
+        # must be recognized by her stable Discord ID.
+        self.solace = FakeAuthor(1496237287825080390, "Solace D Salvatore", bot=True)
         self.channel = FakeChannel()
         self.fake_bot = FakeBot(self.colin)
         main.bot_to_bot_cooldowns.clear()
@@ -175,10 +177,11 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             mention_everyone=True,
         )
         with (
+            patch.object(main, "solace_discord_user_id", self.solace.id),
             patch.object(
                 main,
                 "bot_everyone_trigger_ids",
-                {self.solace.id},
+                set(),
             ),
             patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
         ):
@@ -190,9 +193,37 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             handler.await_args.args[1],
             "What is everyone grateful for today?",
         )
-        self.assertEqual(handler.await_args.kwargs["source"], "companion-bot")
+        self.assertEqual(
+            handler.await_args.kwargs["source"],
+            "solace-mention-everyone",
+        )
         self.assertTrue(handler.await_args.kwargs["reply_to_trigger"])
         self.assertIn("one more question", self.saved_messages()[0]["content"])
+
+    async def test_solace_raw_here_text_triggers_without_discord_mention_flag(self) -> None:
+        message = FakeMessage(
+            25,
+            self.solace,
+            "@here What made everyone smile today?",
+            channel=self.channel,
+            mention_everyone=False,
+        )
+        with (
+            patch.object(main, "solace_discord_user_id", self.solace.id),
+            patch.object(main, "bot_everyone_trigger_ids", set()),
+            patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
+        ):
+            await main.on_message(message)
+
+        handler.assert_awaited_once()
+        self.assertEqual(
+            handler.await_args.args[1],
+            "What made everyone smile today?",
+        )
+        self.assertEqual(
+            handler.await_args.kwargs["source"],
+            "solace-mention-everyone",
+        )
 
     async def test_unallowlisted_companion_everyone_is_observed_only(self) -> None:
         message = FakeMessage(

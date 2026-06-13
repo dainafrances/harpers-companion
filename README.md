@@ -42,6 +42,7 @@ You will need:
 - an OpenRouter API key
 - optional: `BOT_REPLY_COOLDOWN_SECONDS` to limit how often Colin replies to bot-origin messages in a channel
 - optional: `BOT_EVERYONE_TRIGGER_IDS` with comma-separated companion bot IDs allowed to address Colin through `@everyone` (defaults to Solace's ID)
+- optional: `SOLACE_DISCORD_USER_ID` to identify Solace by stable Discord ID even if her display name changes
 - optional: `MAX_REPLY_TOKENS` to control max model output tokens (default `2500`)
 
 ## Trusted companion `@everyone` questions
@@ -50,6 +51,12 @@ Colin normally answers another companion only when that bot directly mentions hi
 or replies to one of his messages. A bot listed in `BOT_EVERYONE_TRIGGER_IDS` may
 also address him through `@everyone`. The default example contains Solace's Discord
 ID (`1496237287825080390`).
+
+Solace is also recognized directly through `SOLACE_DISCORD_USER_ID`, without
+requiring her display name to match `COMPANION_BOT_NAMES`. Colin accepts either
+Discord's `mention_everyone` signal or the literal `@everyone` / `@here` text
+from that trusted ID. This mirrors Discord deployments where the mention flag is
+not present on the received bot-authored message.
 
 This exception does not bypass Colin's bot-loop protections. His one-exchange latch,
 per-channel time cooldown, message-ID deduplication, and safe mention handling still
