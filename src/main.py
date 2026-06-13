@@ -606,8 +606,7 @@ async def on_message(message: discord.Message) -> None:
             return
 
         cleaned = (message.content or "").strip()
-        if bot.user and mention_hit:
-            cleaned = strip_bot_mention(cleaned, bot.user.id)
+        cleaned = strip_bot_mention(cleaned, bot.user.id) if bot.user else cleaned
         if not cleaned:
             cleaned = "I'm here."
 
