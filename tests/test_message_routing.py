@@ -225,6 +225,57 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             "solace-mention-everyone",
         )
 
+    async def test_solace_everyone_opens_new_exchange_after_previous_latch(self) -> None:
+        message = FakeMessage(
+            26,
+            self.solace,
+            "@everyone What are we thinking about today?",
+            channel=self.channel,
+            mention_everyone=True,
+        )
+        main.bot_to_bot_cooldowns.add(self.solace.id)
+
+        with (
+            patch.object(main, "solace_discord_user_id", self.solace.id),
+            patch.object(main, "bot_everyone_trigger_ids", set()),
+            patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
+        ):
+            await main.on_message(message)
+
+        handler.assert_awaited_once()
+        self.assertEqual(
+            handler.await_args.args[1],
+            "What are we thinking about today?",
+        )
+        self.assertEqual(
+            handler.await_args.kwargs["source"],
+            "solace-mention-everyone",
+        )
+        self.assertIn(self.solace.id, main.bot_to_bot_cooldowns)
+
+    async def test_solace_everyone_still_obeys_channel_time_cooldown(self) -> None:
+        message = FakeMessage(
+            27,
+            self.solace,
+            "@everyone A second question too quickly",
+            channel=self.channel,
+            mention_everyone=True,
+        )
+        main.bot_to_bot_cooldowns.add(self.solace.id)
+        main.bot_reply_cooldown_by_channel[self.channel.id] = 112.0
+
+        with (
+            patch.object(main, "solace_discord_user_id", self.solace.id),
+            patch.object(main, "bot_everyone_trigger_ids", set()),
+            patch.object(main.time, "monotonic", return_value=100.0),
+            patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
+        ):
+            await main.on_message(message)
+
+        handler.assert_not_awaited()
+        self.assertIn("second question", self.saved_messages()[0]["content"])
+        self.assertIn(self.solace.id, main.bot_to_bot_cooldowns)
+
     async def test_unallowlisted_companion_everyone_is_observed_only(self) -> None:
         message = FakeMessage(
             24,

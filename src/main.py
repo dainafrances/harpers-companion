@@ -620,7 +620,14 @@ async def on_message(message: discord.Message) -> None:
             save_observed_message(message, source="observed-companion-bot")
             return
 
-        if message.author.id in bot_to_bot_cooldowns:
+        # A trusted broadcast is an explicit invitation to start a new exchange.
+        # Let it reopen this companion's latch after the channel time cooldown has
+        # expired; ordinary mentions/replies still require a human reset.
+        trusted_broadcast_reopens_exchange = (
+            trusted_everyone_hit
+            and message.author.id in bot_to_bot_cooldowns
+        )
+        if message.author.id in bot_to_bot_cooldowns and not trusted_broadcast_reopens_exchange:
             save_observed_message(message, source="observed-companion-bot")
             _debug_log(
                 f"Companion trigger skipped: one-exchange limit reached "
@@ -640,6 +647,14 @@ async def on_message(message: discord.Message) -> None:
                 f"remaining_seconds={remaining:.2f}."
             )
             return
+
+        if trusted_broadcast_reopens_exchange:
+            bot_to_bot_cooldowns.discard(message.author.id)
+            _debug_log(
+                f"Trusted companion broadcast opened a new exchange "
+                f"discord_message_id={message.id} author_id={message.author.id} "
+                f"channel_id={channel_id}."
+            )
 
         cleaned = (message.content or "").strip()
         if bot.user and mention_hit:

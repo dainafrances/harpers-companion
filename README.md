@@ -63,6 +63,12 @@ per-channel time cooldown, message-ID deduplication, and safe mention handling s
 apply. Messages from other bots using `@everyone` are observed as room context but do
 not make Colin answer.
 
+A trusted `@everyone` or `@here` broadcast starts a new controlled exchange even if
+Colin previously answered that same companion. This allows a later daily question
+to work without waiting for a human reset. The per-channel time cooldown still blocks
+rapid repeat broadcasts, and ordinary bot mentions/replies remain limited to one
+exchange until a human addresses Colin.
+
 ## Discord visibility requirements
 
 The code requests Discord's message content intent with `intents.message_content = True`, but code alone cannot make Discord deliver messages Colin is not allowed to see.
