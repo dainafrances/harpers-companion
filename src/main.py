@@ -28,7 +28,7 @@ DISCORD_GUILD_IDS_RAW = os.getenv("DISCORD_GUILD_IDS", "").strip()
 # Backward compatibility with the old single-guild env var
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
 
-MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "anthropic/claude-sonnet-4.5").strip()
+MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-5.5").strip()
 
 # Optional channel restriction list. Leave blank to allow all channels
 # inside the allowed guild(s).

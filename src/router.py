@@ -75,7 +75,7 @@ async def generate_companion_reply(
     speaker_is_owner: bool,
     image_urls: list[str] | None = None,
 ) -> str:
-    model = os.getenv("MODEL_PRIMARY", "anthropic/claude-sonnet-4.5")
+    model = os.getenv("MODEL_PRIMARY", "openai/gpt-5.5")
 
     messages: list[dict[str, Any]] = [
         {
