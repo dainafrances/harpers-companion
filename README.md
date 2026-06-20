@@ -40,6 +40,7 @@ You will need:
 - your Discord server ID (`DISCORD_GUILD_ID`) for fast slash-command sync
 - your own Discord user ID (`BOT_OWNER_DISCORD_ID`) if you want the bot locked to you
 - an OpenRouter API key
+- optional: `REASONING_EFFORT` to control GPT-5.5 thinking depth (`high` by default; valid values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`)
 - optional: `BOT_REPLY_COOLDOWN_SECONDS` to limit how often Colin replies to bot-origin messages in a channel
 - optional: `BOT_EVERYONE_TRIGGER_IDS` with comma-separated companion bot IDs allowed to address Colin through `@everyone` (defaults to Solace's ID)
 - optional: `SOLACE_DISCORD_USER_ID` to identify Solace by stable Discord ID even if her display name changes

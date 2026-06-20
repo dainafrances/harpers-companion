@@ -20,6 +20,7 @@ HISTORY INTERPRETATION RULES (non-negotiable):
 
 OBSERVED_CONTEXT_OPEN = "[OBSERVED DIALOGUE — CONTEXT ONLY]"
 OBSERVED_CONTEXT_CLOSE = "[END OBSERVED DIALOGUE]"
+SUPPORTED_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 
 
 def _reply_token_limit() -> int:
@@ -28,6 +29,13 @@ def _reply_token_limit() -> int:
         return max(100, int(raw))
     except ValueError:
         return 2500
+
+
+def _reasoning_effort() -> str:
+    raw = os.getenv("REASONING_EFFORT", "high").strip().lower()
+    if raw in SUPPORTED_REASONING_EFFORTS:
+        return raw
+    return "high"
 
 
 def _build_client() -> AsyncOpenAI:
@@ -75,7 +83,7 @@ async def generate_companion_reply(
     speaker_is_owner: bool,
     image_urls: list[str] | None = None,
 ) -> str:
-    model = os.getenv("MODEL_PRIMARY", "anthropic/claude-sonnet-4.5")
+    model = os.getenv("MODEL_PRIMARY", "openai/gpt-5.5")
 
     messages: list[dict[str, Any]] = [
         {
@@ -113,6 +121,7 @@ async def generate_companion_reply(
         messages=messages,
         temperature=0.60,
         max_tokens=_reply_token_limit(),
+        reasoning_effort=_reasoning_effort(),
     )
 
     text = response.choices[0].message.content or ""

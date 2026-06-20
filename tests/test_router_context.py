@@ -79,6 +79,20 @@ class RouterContextTests(unittest.IsolatedAsyncioTestCase):
             sent_messages[1],
             {"role": "system", "content": router.HISTORY_INTERPRETATION_RULES},
         )
+        self.assertEqual(create.await_args.kwargs["reasoning_effort"], "high")
+
+    def test_reasoning_effort_defaults_and_validates(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(router._reasoning_effort(), "high")
+
+        with patch.dict(os.environ, {"REASONING_EFFORT": "medium"}, clear=True):
+            self.assertEqual(router._reasoning_effort(), "medium")
+
+        with patch.dict(os.environ, {"REASONING_EFFORT": "XHIGH"}, clear=True):
+            self.assertEqual(router._reasoning_effort(), "xhigh")
+
+        with patch.dict(os.environ, {"REASONING_EFFORT": "turbo-moose"}, clear=True):
+            self.assertEqual(router._reasoning_effort(), "high")
 
 
 if __name__ == "__main__":
