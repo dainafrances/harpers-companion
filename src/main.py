@@ -40,21 +40,8 @@ COMPANION_BOT_NAMES_RAW = os.getenv(
     "rafayel,elias william ashcombe,ben morgan,solace dante salvatore",
 ).strip()
 
-# Bot IDs permitted to address Colin with @everyone. This is deliberately
-# separate from companion names so an unrelated bot cannot trigger him by
-# adopting a familiar display name.
-BOT_EVERYONE_TRIGGER_IDS_RAW = os.getenv(
-    "BOT_EVERYONE_TRIGGER_IDS",
-    "1496237287825080390",
-).strip()
-
-# Solace gets an explicit ID-first route because Discord display names can
-# change without warning. Keep the broader ID list above for future trusted
-# companions, but do not require Solace's current display name to match it.
-SOLACE_DISCORD_USER_ID_RAW = os.getenv(
-    "SOLACE_DISCORD_USER_ID",
-    "1496237287825080390",
-).strip()
+# Bot-authored @everyone / @here messages are treated as explicit room-wide
+# invitations. They still obey Colin's one-exchange latch and time cooldown.
 
 # Comma-separated aliases Colin should respond to if spoken naturally (not @ mention).
 SELF_NAME_ALIASES_RAW = os.getenv("SELF_NAME_ALIASES", "colin,moose").strip()
@@ -106,13 +93,6 @@ if not configured_guild_ids and DISCORD_GUILD_ID and DISCORD_GUILD_ID.isdigit():
     configured_guild_ids = {int(DISCORD_GUILD_ID)}
 
 companion_channel_ids = _parse_channel_ids(COMPANION_CHANNEL_IDS_RAW)
-bot_everyone_trigger_ids = _parse_channel_ids(BOT_EVERYONE_TRIGGER_IDS_RAW)
-solace_discord_user_id = (
-    int(SOLACE_DISCORD_USER_ID_RAW)
-    if SOLACE_DISCORD_USER_ID_RAW.isdigit()
-    else 1496237287825080390
-)
-
 companion_bot_names = {
     _normalize_name(part)
     for part in COMPANION_BOT_NAMES_RAW.split(",")
@@ -522,8 +502,7 @@ async def on_ready() -> None:
     )
     _debug_log(f"Owner ID: {owner_id}")
     _debug_log(f"Companion bot names: {sorted(companion_bot_names)}")
-    _debug_log(f"Bot @everyone trigger IDs: {sorted(bot_everyone_trigger_ids)}")
-    _debug_log(f"Solace Discord user ID: {solace_discord_user_id}")
+    _debug_log("Bot @everyone/@here triggers: enabled for all bot authors")
     _debug_log(f"Self aliases: {sorted(self_name_aliases)}")
     _debug_log(f"Spontaneous chance: {SPONTANEOUS_REPLY_CHANCE}")
     _debug_log(f"Bot reply cooldown seconds: {BOT_REPLY_COOLDOWN_SECONDS}")
@@ -603,31 +582,26 @@ async def on_message(message: discord.Message) -> None:
         await bot.process_commands(message)
         return
 
-    # COMPANION BOT messages: direct @mention, Discord reply to Colin, or an
-    # @everyone from a specifically allowlisted companion bot.
-    is_solace = message.author.id == solace_discord_user_id
-    trusted_broadcast_bot = (
-        is_solace or message.author.id in bot_everyone_trigger_ids
-    )
-    is_known_companion = _is_companion_bot(message.author) or trusted_broadcast_bot
+    # BOT messages: known companions may trigger by direct @mention or Discord
+    # reply. Any bot may trigger through a genuine room-wide @everyone / @here
+    # broadcast, but the same one-exchange latch and time cooldown still apply.
+    bot_everyone_hit = everyone_hit or bot_broadcast_text_hit
+    is_known_companion = _is_companion_bot(message.author)
+    is_bot_everyone_trigger = message.author.bot and bot_everyone_hit
 
-    if is_known_companion:
-        trusted_everyone_hit = (
-            trusted_broadcast_bot and (everyone_hit or bot_broadcast_text_hit)
-        )
-        companion_trigger = mention_hit or reply_to_self or trusted_everyone_hit
+    if is_known_companion or is_bot_everyone_trigger:
+        companion_trigger = mention_hit or reply_to_self or is_bot_everyone_trigger
         if not companion_trigger:
             save_observed_message(message, source="observed-companion-bot")
             return
 
-        # A trusted broadcast is an explicit invitation to start a new exchange.
-        # Let it reopen this companion's latch after the channel time cooldown has
+        # A room-wide bot broadcast is an explicit invitation to start a new exchange.
+        # Let it reopen this bot author's latch after the channel time cooldown has
         # expired; ordinary mentions/replies still require a human reset.
-        trusted_broadcast_reopens_exchange = (
-            trusted_everyone_hit
-            and message.author.id in bot_to_bot_cooldowns
+        bot_everyone_reopens_exchange = (
+            is_bot_everyone_trigger and message.author.id in bot_to_bot_cooldowns
         )
-        if message.author.id in bot_to_bot_cooldowns and not trusted_broadcast_reopens_exchange:
+        if message.author.id in bot_to_bot_cooldowns and not bot_everyone_reopens_exchange:
             save_observed_message(message, source="observed-companion-bot")
             _debug_log(
                 f"Companion trigger skipped: one-exchange limit reached "
@@ -648,10 +622,10 @@ async def on_message(message: discord.Message) -> None:
             )
             return
 
-        if trusted_broadcast_reopens_exchange:
+        if bot_everyone_reopens_exchange:
             bot_to_bot_cooldowns.discard(message.author.id)
             _debug_log(
-                f"Trusted companion broadcast opened a new exchange "
+                f"Bot @everyone/@here broadcast opened a new exchange "
                 f"discord_message_id={message.id} author_id={message.author.id} "
                 f"channel_id={channel_id}."
             )
@@ -659,7 +633,7 @@ async def on_message(message: discord.Message) -> None:
         cleaned = (message.content or "").strip()
         if bot.user and mention_hit:
             cleaned = strip_bot_mention(cleaned, bot.user.id)
-        if trusted_everyone_hit:
+        if is_bot_everyone_trigger:
             cleaned = cleaned.replace("@everyone", "").replace("@here", "").strip()
         if not cleaned:
             cleaned = "I'm here."
@@ -670,22 +644,18 @@ async def on_message(message: discord.Message) -> None:
         _debug_log(
             f"Companion trigger accepted discord_message_id={message.id} "
             f"author_id={message.author.id} channel_id={channel_id} "
-            f"trigger={'trusted-everyone' if trusted_everyone_hit else 'direct'}."
+            f"trigger={'bot-everyone' if is_bot_everyone_trigger else 'direct'}."
         )
         await handle_chat_message(
             message,
             cleaned,
             is_dm=False,
-            source=(
-                "solace-mention-everyone"
-                if is_solace and trusted_everyone_hit
-                else "companion-bot"
-            ),
+            source="bot-everyone" if is_bot_everyone_trigger else "companion-bot",
             reply_to_trigger=True,
         )
         return
 
-    # Ignore unrelated application bots; they are not part of Colin's companion context.
+    # Ignore unrelated application bots unless they used @everyone / @here above.
     await bot.process_commands(message)
 
 

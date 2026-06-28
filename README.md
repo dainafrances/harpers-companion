@@ -42,33 +42,23 @@ You will need:
 - an OpenRouter API key
 - optional: `REASONING_EFFORT` to control GPT-5.5 thinking depth (`high` by default; valid values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`)
 - optional: `BOT_REPLY_COOLDOWN_SECONDS` to limit how often Colin replies to bot-origin messages in a channel
-- optional: `BOT_EVERYONE_TRIGGER_IDS` with comma-separated companion bot IDs allowed to address Colin through `@everyone` (defaults to Solace's ID)
-- optional: `SOLACE_DISCORD_USER_ID` to identify Solace by stable Discord ID even if her display name changes
 - optional: `MAX_REPLY_TOKENS` to control max model output tokens (default `2500`)
 
-## Trusted companion `@everyone` questions
+## Bot `@everyone` questions
 
-Colin normally answers another companion only when that bot directly mentions him
-or replies to one of his messages. A bot listed in `BOT_EVERYONE_TRIGGER_IDS` may
-also address him through `@everyone`. The default example contains Solace's Discord
-ID (`1496237287825080390`).
+Colin normally answers another bot only when that bot directly mentions him or
+replies to one of his messages. A bot-authored `@everyone` or `@here` message is
+also treated as an explicit room-wide invitation, even if that bot is not listed
+in `COMPANION_BOT_NAMES`. Colin accepts either Discord's `mention_everyone` signal
+or the literal `@everyone` / `@here` text in the received message. This covers
+Discord deployments where the mention flag is not present on bot-authored messages.
 
-Solace is also recognized directly through `SOLACE_DISCORD_USER_ID`, without
-requiring her display name to match `COMPANION_BOT_NAMES`. Colin accepts either
-Discord's `mention_everyone` signal or the literal `@everyone` / `@here` text
-from that trusted ID. This mirrors Discord deployments where the mention flag is
-not present on the received bot-authored message.
-
-This exception does not bypass Colin's bot-loop protections. His one-exchange latch,
+This does not bypass Colin's bot-loop protections. His one-exchange latch,
 per-channel time cooldown, message-ID deduplication, and safe mention handling still
-apply. Messages from other bots using `@everyone` are observed as room context but do
-not make Colin answer.
-
-A trusted `@everyone` or `@here` broadcast starts a new controlled exchange even if
-Colin previously answered that same companion. This allows a later daily question
-to work without waiting for a human reset. The per-channel time cooldown still blocks
-rapid repeat broadcasts, and ordinary bot mentions/replies remain limited to one
-exchange until a human addresses Colin.
+apply. A bot `@everyone` or `@here` broadcast may start a new controlled exchange
+even if Colin previously answered that same bot, but the per-channel time cooldown
+still blocks rapid repeat broadcasts. Ordinary bot mentions/replies remain limited
+to one exchange until a human addresses Colin.
 
 ## Discord visibility requirements
 

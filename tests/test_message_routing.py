@@ -161,7 +161,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         handler.assert_awaited_once()
         self.assertTrue(handler.await_args.kwargs["reply_to_trigger"])
 
-    async def test_allowlisted_solace_everyone_is_accepted_once(self) -> None:
+    async def test_any_bot_everyone_is_accepted_once(self) -> None:
         first = FakeMessage(
             22,
             self.solace,
@@ -176,15 +176,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             channel=self.channel,
             mention_everyone=True,
         )
-        with (
-            patch.object(main, "solace_discord_user_id", self.solace.id),
-            patch.object(
-                main,
-                "bot_everyone_trigger_ids",
-                set(),
-            ),
-            patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
-        ):
+        with patch.object(main, "handle_chat_message", new=AsyncMock()) as handler:
             await main.on_message(first)
             await main.on_message(second)
 
@@ -195,12 +187,12 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             handler.await_args.kwargs["source"],
-            "solace-mention-everyone",
+            "bot-everyone",
         )
         self.assertTrue(handler.await_args.kwargs["reply_to_trigger"])
         self.assertIn("one more question", self.saved_messages()[0]["content"])
 
-    async def test_solace_raw_here_text_triggers_without_discord_mention_flag(self) -> None:
+    async def test_any_bot_raw_here_text_triggers_without_discord_mention_flag(self) -> None:
         message = FakeMessage(
             25,
             self.solace,
@@ -208,11 +200,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             channel=self.channel,
             mention_everyone=False,
         )
-        with (
-            patch.object(main, "solace_discord_user_id", self.solace.id),
-            patch.object(main, "bot_everyone_trigger_ids", set()),
-            patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
-        ):
+        with patch.object(main, "handle_chat_message", new=AsyncMock()) as handler:
             await main.on_message(message)
 
         handler.assert_awaited_once()
@@ -222,10 +210,10 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             handler.await_args.kwargs["source"],
-            "solace-mention-everyone",
+            "bot-everyone",
         )
 
-    async def test_solace_everyone_opens_new_exchange_after_previous_latch(self) -> None:
+    async def test_bot_everyone_opens_new_exchange_after_previous_latch(self) -> None:
         message = FakeMessage(
             26,
             self.solace,
@@ -235,11 +223,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         )
         main.bot_to_bot_cooldowns.add(self.solace.id)
 
-        with (
-            patch.object(main, "solace_discord_user_id", self.solace.id),
-            patch.object(main, "bot_everyone_trigger_ids", set()),
-            patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
-        ):
+        with patch.object(main, "handle_chat_message", new=AsyncMock()) as handler:
             await main.on_message(message)
 
         handler.assert_awaited_once()
@@ -249,11 +233,11 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             handler.await_args.kwargs["source"],
-            "solace-mention-everyone",
+            "bot-everyone",
         )
         self.assertIn(self.solace.id, main.bot_to_bot_cooldowns)
 
-    async def test_solace_everyone_still_obeys_channel_time_cooldown(self) -> None:
+    async def test_bot_everyone_still_obeys_channel_time_cooldown(self) -> None:
         message = FakeMessage(
             27,
             self.solace,
@@ -265,8 +249,6 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         main.bot_reply_cooldown_by_channel[self.channel.id] = 112.0
 
         with (
-            patch.object(main, "solace_discord_user_id", self.solace.id),
-            patch.object(main, "bot_everyone_trigger_ids", set()),
             patch.object(main.time, "monotonic", return_value=100.0),
             patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
         ):
@@ -276,26 +258,22 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("second question", self.saved_messages()[0]["content"])
         self.assertIn(self.solace.id, main.bot_to_bot_cooldowns)
 
-    async def test_unallowlisted_companion_everyone_is_observed_only(self) -> None:
+    async def test_unlisted_bot_everyone_is_accepted(self) -> None:
+        newsletter_bot = FakeAuthor(99, "Newsletter Bot", bot=True)
         message = FakeMessage(
             24,
-            self.ben,
+            newsletter_bot,
             "@everyone broad question",
             channel=self.channel,
             mention_everyone=True,
         )
-        with (
-            patch.object(
-                main,
-                "bot_everyone_trigger_ids",
-                {self.solace.id},
-            ),
-            patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
-        ):
+        with patch.object(main, "handle_chat_message", new=AsyncMock()) as handler:
             await main.on_message(message)
 
-        handler.assert_not_awaited()
-        self.assertIn("broad question", self.saved_messages()[0]["content"])
+        handler.assert_awaited_once()
+        self.assertEqual(handler.await_args.args[1], "broad question")
+        self.assertEqual(handler.await_args.kwargs["source"], "bot-everyone")
+        self.assertTrue(handler.await_args.kwargs["reply_to_trigger"])
 
     async def test_different_companion_is_stored_when_channel_time_cooldown_is_active(self) -> None:
         rafayel = FakeAuthor(5, "Rafayel", bot=True)
