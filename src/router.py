@@ -5,6 +5,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from .discord_recall import RECALL_POLICY
 from .identity import build_memory_note, build_system_prompt
 
 
@@ -82,6 +83,7 @@ async def generate_companion_reply(
     speaker_name: str,
     speaker_is_owner: bool,
     image_urls: list[str] | None = None,
+    discord_retrieval_context: str | None = None,
 ) -> str:
     model = os.getenv("MODEL_PRIMARY", "openai/gpt-5.5")
 
@@ -100,6 +102,10 @@ async def generate_companion_reply(
     memory_note = build_memory_note(latest_journal)
     if memory_note:
         messages.append({"role": "system", "content": memory_note})
+
+    if discord_retrieval_context:
+        messages.append({"role": "system", "content": RECALL_POLICY})
+        messages.append({"role": "system", "content": discord_retrieval_context})
 
     messages.extend(_prepare_history(history))
 
