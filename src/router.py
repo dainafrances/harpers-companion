@@ -7,6 +7,7 @@ from openai import AsyncOpenAI
 
 from .discord_recall import RECALL_POLICY
 from .identity import build_memory_note, build_system_prompt
+from .room_context import ROOM_CONTEXT_RULES
 
 
 HISTORY_INTERPRETATION_RULES = """
@@ -97,6 +98,7 @@ async def generate_companion_reply(
             ),
         },
         {"role": "system", "content": HISTORY_INTERPRETATION_RULES},
+        {"role": "system", "content": ROOM_CONTEXT_RULES},
     ]
 
     memory_note = build_memory_note(latest_journal)

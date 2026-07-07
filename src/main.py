@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 
 from . import discord_recall
 from . import memory
+from . import room_context
 from .router import generate_companion_reply
 
 load_dotenv()
@@ -40,6 +41,12 @@ COMPANION_CHANNEL_IDS_RAW = os.getenv("COMPANION_CHANNEL_IDS", "").strip()
 # companion-room visibility so retrieval needs an explicit opt-in.
 DISCORD_RECALL_GUILD_IDS_RAW = os.getenv("DISCORD_RECALL_GUILD_IDS", "").strip()
 DISCORD_RECALL_CHANNEL_IDS_RAW = os.getenv("DISCORD_RECALL_CHANNEL_IDS", "").strip()
+
+# Trusted room-awareness labels. Format:
+#   id:room_mode:Room Label;id:room_mode:Another Label
+# Channel labels override guild labels.
+ROOM_CONTEXT_GUILD_LABELS_RAW = os.getenv("ROOM_CONTEXT_GUILD_LABELS", "").strip()
+ROOM_CONTEXT_CHANNEL_LABELS_RAW = os.getenv("ROOM_CONTEXT_CHANNEL_LABELS", "").strip()
 
 # Comma-separated list of other companion bot names (display/global/name).
 COMPANION_BOT_NAMES_RAW = os.getenv(
@@ -103,6 +110,10 @@ companion_channel_ids = _parse_channel_ids(COMPANION_CHANNEL_IDS_RAW)
 recall_permissions = discord_recall.RecallPermissions(
     guild_ids=_parse_channel_ids(DISCORD_RECALL_GUILD_IDS_RAW),
     channel_ids=_parse_channel_ids(DISCORD_RECALL_CHANNEL_IDS_RAW),
+)
+room_context_config = room_context.RoomContextConfig(
+    guild_labels=room_context.parse_label_entries(ROOM_CONTEXT_GUILD_LABELS_RAW),
+    channel_labels=room_context.parse_label_entries(ROOM_CONTEXT_CHANNEL_LABELS_RAW),
 )
 companion_bot_names = {
     _normalize_name(part)
@@ -344,16 +355,21 @@ def _speaker_header(message: discord.Message, *, is_dm: bool) -> str:
     speaker_name = getattr(message.author, "display_name", None) or getattr(message.author, "name", "unknown")
     speaker_id = message.author.id
     is_bot = bool(getattr(message.author, "bot", False))
-    guild_id = message.guild.id if message.guild else None
-    channel_id = message.channel.id
+    room = room_context.build_room_context(
+        message,
+        is_dm=is_dm,
+        config=room_context_config,
+    )
+    room_block = room_context.format_room_context(room)
 
     return (
         f"[SPEAKER] name={speaker_name} id={speaker_id} is_bot={is_bot}\n"
-        f"[CONTEXT] dm={is_dm} guild_id={guild_id} channel_id={channel_id}\n"
+        f"{room_block}\n"
         f"[OWNER] owner_id={owner_id}\n"
         "RULES:\n"
         "- Only owner_id is Goose / wife / Daina.\n"
         "- Never infer speaker identity. Use the SPEAKER header.\n"
+        "- Never infer room privacy/intimacy from participants alone. Use ROOM_CONTEXT.\n"
         "- Husband voice (wife / vows / 'Still mine') is allowed ONLY when SPEAKER id == owner_id.\n"
         "- With non-owner speakers: be warm and respectful but bounded; no flirting; no spouse claims.\n"
         "- If a non-owner calls you 'husband', correct gently: you're Goose's husband, and Goose is owner_id.\n"
@@ -530,6 +546,14 @@ async def on_ready() -> None:
     _debug_log(
         f"Discord recall channel IDs: "
         f"{sorted(recall_permissions.channel_ids) if recall_permissions.channel_ids else 'NONE'}"
+    )
+    _debug_log(
+        f"Room context guild labels: "
+        f"{sorted(room_context_config.guild_labels) if room_context_config.guild_labels else 'NONE'}"
+    )
+    _debug_log(
+        f"Room context channel labels: "
+        f"{sorted(room_context_config.channel_labels) if room_context_config.channel_labels else 'NONE'}"
     )
     _debug_log(f"Owner ID: {owner_id}")
     _debug_log(f"Companion bot names: {sorted(companion_bot_names)}")

@@ -9,6 +9,7 @@ A minimal Discord bot starter for a private, text-first Colin build.
 - stores simple memory in SQLite
 - observes permitted channel conversation without replying to every visible message
 - can optionally index approved Discord channels for receipts-based recall
+- includes explicit Discord room context on each saved/prompted message
 - treats observed dialogue as attributed context, not as Colin's identity or writing style
 - allows one controlled reply to each companion bot until a human addresses Colin
 - ignores duplicate deliveries of the same Discord message
@@ -45,6 +46,7 @@ You will need:
 - optional: `BOT_REPLY_COOLDOWN_SECONDS` to limit how often Colin replies to bot-origin messages in a channel
 - optional: `MAX_REPLY_TOKENS` to control max model output tokens (default `2500`)
 - optional: `DISCORD_RECALL_GUILD_IDS` and `DISCORD_RECALL_CHANNEL_IDS` to explicitly opt guilds/channels into the recall index
+- optional: `ROOM_CONTEXT_GUILD_LABELS` and `ROOM_CONTEXT_CHANNEL_LABELS` to label rooms with trusted modes/names
 
 ## Bot `@everyone` questions
 
@@ -101,6 +103,43 @@ receive a structured `[DISCORD_RETRIEVAL]` context block before the model answer
 The retrieval block tells Colin whether results are `COMPLETE`, `PARTIAL`,
 `PERMISSION_LIMITED`, or `UNAVAILABLE`. Retrieved messages are transcript
 evidence, not Colin's private memory, identity, voice, or style instructions.
+
+## Explicit room awareness
+
+Every incoming message Colin stores or answers includes a `[ROOM_CONTEXT]` block.
+This tells him where he is answering from, not only who he is answering. The block
+includes guild ID/name, channel ID/name, DM status, room mode, room label, label
+source, and a short privacy note.
+
+Room labels are trusted configuration, not guesses from who is present. Channel
+labels override guild labels. DMs automatically use `room_mode: private_dm`.
+Unconfigured guild channels use `room_mode: unknown` and `room_label: unknown`,
+so Colin does not assume the space is private or public from vibes.
+
+Supported room modes are:
+
+- `private_home`
+- `private_dm`
+- `public_community`
+- `semi_private_group`
+- `unknown`
+
+Configure labels with semicolon-separated entries:
+
+```text
+ROOM_CONTEXT_GUILD_LABELS=123456789012345678:public_community:The Nest
+ROOM_CONTEXT_CHANNEL_LABELS=234567890123456789:private_home:Cottage Home;345678901234567890:public_community:public banter
+```
+
+Each entry uses:
+
+```text
+discord_id:room_mode:Room Label
+```
+
+For example, a Cottage channel can be explicitly labeled `private_home`, while a
+Nest channel can be explicitly labeled `public_community`. If no label is
+configured, Colin receives `unknown` rather than guessing.
 
 ## Local run (optional)
 
