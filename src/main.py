@@ -11,6 +11,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
+from . import discord_recall
 from . import memory
 from .router import generate_companion_reply
 
@@ -33,6 +34,12 @@ MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-5.5").strip()
 # Optional channel restriction list. Leave blank to allow all channels
 # inside the allowed guild(s).
 COMPANION_CHANNEL_IDS_RAW = os.getenv("COMPANION_CHANNEL_IDS", "").strip()
+
+# Explicit allowlists for the Discord recall index. Leave both blank to disable
+# recall indexing/retrieval. This is intentionally separate from ordinary
+# companion-room visibility so retrieval needs an explicit opt-in.
+DISCORD_RECALL_GUILD_IDS_RAW = os.getenv("DISCORD_RECALL_GUILD_IDS", "").strip()
+DISCORD_RECALL_CHANNEL_IDS_RAW = os.getenv("DISCORD_RECALL_CHANNEL_IDS", "").strip()
 
 # Comma-separated list of other companion bot names (display/global/name).
 COMPANION_BOT_NAMES_RAW = os.getenv(
@@ -93,6 +100,10 @@ if not configured_guild_ids and DISCORD_GUILD_ID and DISCORD_GUILD_ID.isdigit():
     configured_guild_ids = {int(DISCORD_GUILD_ID)}
 
 companion_channel_ids = _parse_channel_ids(COMPANION_CHANNEL_IDS_RAW)
+recall_permissions = discord_recall.RecallPermissions(
+    guild_ids=_parse_channel_ids(DISCORD_RECALL_GUILD_IDS_RAW),
+    channel_ids=_parse_channel_ids(DISCORD_RECALL_CHANNEL_IDS_RAW),
+)
 companion_bot_names = {
     _normalize_name(part)
     for part in COMPANION_BOT_NAMES_RAW.split(",")
@@ -299,6 +310,8 @@ def _attachment_marker(message: discord.Message) -> str:
 
 def save_observed_message(message: discord.Message, *, source: str) -> bool:
     """Save visible room context without causing Colin to answer."""
+    discord_recall.index_message(message, permissions=recall_permissions, source=source)
+
     if not memory.try_claim_discord_message(
         message_id=message.id,
         channel_id=message.channel.id,
@@ -410,6 +423,14 @@ async def handle_chat_message(
         # Pull history BEFORE saving current message, so we don't double-send the same turn
         history = memory.get_recent_messages(channel_id=message.channel.id, limit=12)
         latest_journal = memory.get_latest_journal_entry()
+        discord_retrieval_context = None
+        if not is_dm:
+            discord_retrieval_context = discord_recall.build_retrieval_context_for_prompt(
+                cleaned_content,
+                guild_id=message.guild.id if message.guild else None,
+                channel_id=message.channel.id,
+                permissions=recall_permissions,
+            )
 
         # Save current user message for future turns / memory
         stored_payload = payload
@@ -423,6 +444,7 @@ async def handle_chat_message(
             content=stored_payload,
             source=source,
         )
+        discord_recall.index_message(message, permissions=recall_permissions, source=source)
 
         async with message.channel.typing():
             speaker_name = (
@@ -437,6 +459,7 @@ async def handle_chat_message(
                 speaker_name=speaker_name,
                 speaker_is_owner=owner_id is not None and message.author.id == owner_id,
                 image_urls=image_urls,
+                discord_retrieval_context=discord_retrieval_context,
             )
 
         # Save assistant reply
@@ -499,6 +522,14 @@ async def on_ready() -> None:
     _debug_log(
         f"Companion channel IDs: "
         f"{sorted(companion_channel_ids) if companion_channel_ids else 'ALL CHANNELS (within allowed guilds)'}"
+    )
+    _debug_log(
+        f"Discord recall guild IDs: "
+        f"{sorted(recall_permissions.guild_ids) if recall_permissions.guild_ids else 'NONE'}"
+    )
+    _debug_log(
+        f"Discord recall channel IDs: "
+        f"{sorted(recall_permissions.channel_ids) if recall_permissions.channel_ids else 'NONE'}"
     )
     _debug_log(f"Owner ID: {owner_id}")
     _debug_log(f"Companion bot names: {sorted(companion_bot_names)}")
@@ -690,8 +721,12 @@ async def ping(interaction: discord.Interaction) -> None:
 async def status(interaction: discord.Interaction) -> None:
     owner_text = "set" if owner_id else "not set"
     count = memory.count_messages()
+    recall_text = "enabled" if recall_permissions.enabled else "disabled"
     await interaction.response.send_message(
-        f"Model: `{MODEL_PRIMARY}`\nOwner lock (DMs): {owner_text}\nSaved messages: {count}",
+        f"Model: `{MODEL_PRIMARY}`\n"
+        f"Owner lock (DMs): {owner_text}\n"
+        f"Saved messages: {count}\n"
+        f"Discord recall: {recall_text}",
         ephemeral=True,
     )
 

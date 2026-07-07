@@ -8,6 +8,7 @@ A minimal Discord bot starter for a private, text-first Colin build.
 - replies when mentioned in a server
 - stores simple memory in SQLite
 - observes permitted channel conversation without replying to every visible message
+- can optionally index approved Discord channels for receipts-based recall
 - treats observed dialogue as attributed context, not as Colin's identity or writing style
 - allows one controlled reply to each companion bot until a human addresses Colin
 - ignores duplicate deliveries of the same Discord message
@@ -43,6 +44,7 @@ You will need:
 - optional: `REASONING_EFFORT` to control GPT-5.5 thinking depth (`high` by default; valid values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`)
 - optional: `BOT_REPLY_COOLDOWN_SECONDS` to limit how often Colin replies to bot-origin messages in a channel
 - optional: `MAX_REPLY_TOKENS` to control max model output tokens (default `2500`)
+- optional: `DISCORD_RECALL_GUILD_IDS` and `DISCORD_RECALL_CHANNEL_IDS` to explicitly opt guilds/channels into the recall index
 
 ## Bot `@everyone` questions
 
@@ -76,6 +78,29 @@ In every Discord channel Colin should observe, his bot role also needs:
 - **Read Message History**
 
 The code-side observation change stores visible human and configured companion-bot messages without automatically answering them. The portal intent and channel permissions are a separate manual requirement; missing messages cannot be recovered later if Discord never delivered them.
+
+## Permission-aware Discord recall
+
+Discord recall is off unless you explicitly configure at least one recall guild or
+channel. This is separate from ordinary companion-room visibility: a channel can
+be visible to Colin without being added to the retrieval index.
+
+Use these environment variables to opt approved spaces into recall:
+
+```text
+DISCORD_RECALL_GUILD_IDS=123456789012345678
+DISCORD_RECALL_CHANNEL_IDS=234567890123456789,345678901234567890
+```
+
+When recall is enabled, Colin indexes approved messages with Discord provenance:
+message ID, speaker display name, speaker Discord user ID, timestamp, guild ID,
+channel ID, channel name, and message content. Recall-style questions such as
+“What is the latest thing Rachael said?” or “Can you see the other conversation?”
+receive a structured `[DISCORD_RETRIEVAL]` context block before the model answers.
+
+The retrieval block tells Colin whether results are `COMPLETE`, `PARTIAL`,
+`PERMISSION_LIMITED`, or `UNAVAILABLE`. Retrieved messages are transcript
+evidence, not Colin's private memory, identity, voice, or style instructions.
 
 ## Local run (optional)
 
