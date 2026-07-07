@@ -79,6 +79,7 @@ class RouterContextTests(unittest.IsolatedAsyncioTestCase):
             sent_messages[1],
             {"role": "system", "content": router.HISTORY_INTERPRETATION_RULES},
         )
+        self.assertIn("ROOM CONTEXT RULES", sent_messages[2]["content"])
         self.assertEqual(create.await_args.kwargs["reasoning_effort"], "high")
 
     def test_reasoning_effort_defaults_and_validates(self) -> None:

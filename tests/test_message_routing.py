@@ -28,8 +28,9 @@ class FakeAuthor:
 
 
 class FakeChannel:
-    def __init__(self, channel_id: int = 500) -> None:
+    def __init__(self, channel_id: int = 500, name: str = "the-nest") -> None:
         self.id = channel_id
+        self.name = name
         self.sent: list[tuple[str, dict]] = []
 
     async def send(self, content: str, **kwargs) -> None:
@@ -63,7 +64,7 @@ class FakeMessage:
         self.author = author
         self.content = content
         self.channel = channel
-        self.guild = SimpleNamespace(id=700)
+        self.guild = SimpleNamespace(id=700, name="Nest Guild")
         self.mentions = mentions or []
         self.mention_everyone = mention_everyone
         self.attachments = attachments or []
@@ -118,6 +119,9 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             await main.on_message(message)
         handler.assert_not_awaited()
         self.assertIn("name=Rachael", self.saved_messages()[0]["content"])
+        self.assertIn("[ROOM_CONTEXT]", self.saved_messages()[0]["content"])
+        self.assertIn("guild_name: Nest Guild", self.saved_messages()[0]["content"])
+        self.assertIn("channel_name: the-nest", self.saved_messages()[0]["content"])
         self.assertIn("Room context", self.saved_messages()[0]["content"])
 
     async def test_normal_reply_path_passes_actual_owner_speaker_metadata(self) -> None:
@@ -142,6 +146,30 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             await main.on_message(message)
         handler.assert_not_awaited()
         self.assertIn("Colin is plain text only", self.saved_messages()[0]["content"])
+
+    async def test_configured_room_label_is_saved_with_observed_message(self) -> None:
+        message = FakeMessage(28, self.other_human, "Cottage room context", channel=self.channel)
+        config = main.room_context.RoomContextConfig(
+            guild_labels={},
+            channel_labels={
+                self.channel.id: main.room_context.RoomLabel(
+                    main.room_context.RoomMode.PRIVATE_HOME,
+                    "Cottage Home",
+                )
+            },
+        )
+
+        with (
+            patch.object(main, "room_context_config", config),
+            patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
+        ):
+            await main.on_message(message)
+
+        handler.assert_not_awaited()
+        saved = self.saved_messages()[0]["content"]
+        self.assertIn("room_mode: private_home", saved)
+        self.assertIn("room_label: Cottage Home", saved)
+        self.assertIn("label_source: channel", saved)
 
     async def test_direct_companion_mention_is_accepted_once(self) -> None:
         first = FakeMessage(12, self.ben, "<@1> hello", channel=self.channel, mentions=[self.colin])
