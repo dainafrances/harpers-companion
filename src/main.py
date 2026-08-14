@@ -12,6 +12,7 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from . import discord_recall
+from . import document_reader
 from . import memory
 from . import room_context
 from .router import generate_companion_reply
@@ -436,6 +437,28 @@ async def handle_chat_message(
         # De-dupe while preserving order
         image_urls = list(dict.fromkeys(image_urls))
 
+        document_blocks: list[str] = []
+        for attachment in message.attachments:
+            filename = attachment.filename or "attachment"
+            if not document_reader.is_supported_document(
+                filename=filename,
+                content_type=attachment.content_type,
+            ):
+                continue
+            try:
+                extracted = document_reader.extract_document_text(
+                    filename=filename,
+                    data=await attachment.read(),
+                )
+                document_blocks.append(
+                    f"[DOCUMENT: {extracted.filename}]\n{extracted.text}\n[END DOCUMENT]"
+                )
+            except (ValueError, OSError) as error:
+                document_blocks.append(f"[DOCUMENT: {filename}]\n[Unreadable: {error}]\n[END DOCUMENT]")
+
+        if document_blocks:
+            payload += "\n\n" + "\n\n".join(document_blocks)
+
         # Pull history BEFORE saving current message, so we don't double-send the same turn
         history = memory.get_recent_messages(channel_id=message.channel.id, limit=12)
         latest_journal = memory.get_latest_journal_entry()
@@ -452,6 +475,8 @@ async def handle_chat_message(
         stored_payload = payload
         if image_urls:
             stored_payload += f"\n[ATTACHMENTS: {len(image_urls)} image(s)/gif(s)]"
+        if document_blocks:
+            stored_payload += f"\n[DOCUMENTS: {len(document_blocks)} extracted]"
 
         memory.save_message(
             channel_id=message.channel.id,

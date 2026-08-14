@@ -81,6 +81,19 @@ class RouterContextTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("ROOM CONTEXT RULES", sent_messages[2]["content"])
         self.assertEqual(create.await_args.kwargs["reasoning_effort"], "high")
+        self.assertEqual(create.await_args.kwargs["tools"][0]["type"], "openrouter:web_search")
+
+    def test_citations_are_appended_once(self) -> None:
+        annotations = [
+            {"url_citation": {"title": "Example", "url": "https://example.com"}},
+            {"url_citation": {"title": "Example", "url": "https://example.com"}},
+        ]
+        rendered = router._append_citations("Reply", annotations)
+        self.assertEqual(rendered.count("https://example.com"), 1)
+
+    def test_web_search_can_be_disabled(self) -> None:
+        with patch.dict(os.environ, {"ENABLE_WEB_SEARCH": "false"}, clear=True):
+            self.assertEqual(router._web_search_tool(), [])
 
     def test_reasoning_effort_defaults_and_validates(self) -> None:
         with patch.dict(os.environ, {}, clear=True):

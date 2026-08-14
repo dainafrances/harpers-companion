@@ -40,6 +40,35 @@ def _reasoning_effort() -> str:
     return "high"
 
 
+def _web_search_enabled() -> bool:
+    return os.getenv("ENABLE_WEB_SEARCH", "true").strip().lower() not in {"0", "false", "no"}
+
+
+def _web_search_tool() -> list[dict[str, Any]]:
+    if not _web_search_enabled():
+        return []
+    return [{
+        "type": "openrouter:web_search",
+        "parameters": {"max_results": 5},
+    }]
+
+
+def _append_citations(text: str, annotations: Any) -> str:
+    sources: list[str] = []
+    for annotation in annotations or []:
+        citation = getattr(annotation, "url_citation", None)
+        if citation is None and isinstance(annotation, dict):
+            citation = annotation.get("url_citation")
+        if citation is None:
+            continue
+        url = getattr(citation, "url", None) if not isinstance(citation, dict) else citation.get("url")
+        title = getattr(citation, "title", None) if not isinstance(citation, dict) else citation.get("title")
+        if url:
+            sources.append(f"- [{title or url}]({url})")
+    unique_sources = list(dict.fromkeys(sources))
+    return text if not unique_sources else text.rstrip() + "\n\nSources:\n" + "\n".join(unique_sources)
+
+
 def _build_client() -> AsyncOpenAI:
     api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not api_key:
@@ -130,7 +159,9 @@ async def generate_companion_reply(
         temperature=0.60,
         max_tokens=_reply_token_limit(),
         reasoning_effort=_reasoning_effort(),
+        tools=_web_search_tool(),
     )
 
-    text = response.choices[0].message.content or ""
+    message = response.choices[0].message
+    text = _append_citations(message.content or "", getattr(message, "annotations", None))
     return text.strip() or "UNKNOWN. I lost the thread for a second."

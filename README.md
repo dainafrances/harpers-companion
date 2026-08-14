@@ -17,6 +17,7 @@ A minimal Discord bot starter for a private, text-first Colin build.
 - writes a nightly heartbeat journal entry
 - includes slash commands for `/ping`, `/status`, and `/journal_now`
 - uses OpenRouter as the model transport through the OpenAI-compatible client
+- reads supported document attachments and can search the web with source links
 
 ## Folder layout
 
@@ -45,6 +46,8 @@ You will need:
 - optional: `REASONING_EFFORT` to control GPT-5.5 thinking depth (`high` by default; valid values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`)
 - optional: `BOT_REPLY_COOLDOWN_SECONDS` to limit how often Colin replies to bot-origin messages in a channel
 - optional: `MAX_REPLY_TOKENS` to control max model output tokens (default `2500`)
+- optional: `ENABLE_WEB_SEARCH` to turn OpenRouter web search on or off (`true` by default)
+- optional: `MAX_DOCUMENT_BYTES` and `MAX_DOCUMENT_CHARS` to cap document processing
 - optional: `DISCORD_RECALL_GUILD_IDS` and `DISCORD_RECALL_CHANNEL_IDS` to explicitly opt guilds/channels into the recall index
 - optional: `ROOM_CONTEXT_GUILD_LABELS` and `ROOM_CONTEXT_CHANNEL_LABELS` to label rooms with trusted modes/names
 
@@ -65,6 +68,16 @@ still blocks rapid repeat broadcasts. Ordinary bot mentions/replies remain limit
 to one exchange until a human addresses Colin.
 
 ## Discord visibility requirements
+
+## Document uploads and web research
+
+Colin can read attached `.txt`, `.md`, `.csv`, `.pdf`, and `.docx` files. Text is
+extracted locally by the bot and supplied with the message; files above the configured
+size limit are not processed. Image attachments continue to use the existing vision flow.
+
+Web research uses OpenRouter's `openrouter:web_search` server tool. It is enabled by
+default, and Colin can include source links in his reply. Set `ENABLE_WEB_SEARCH=false`
+to disable it for a deployment.
 
 The code requests Discord's message content intent with `intents.message_content = True`, but code alone cannot make Discord deliver messages Colin is not allowed to see.
 
