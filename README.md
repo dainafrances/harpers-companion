@@ -43,7 +43,8 @@ You will need:
 - your Discord server ID (`DISCORD_GUILD_ID`) for fast slash-command sync
 - your own Discord user ID (`BOT_OWNER_DISCORD_ID`) if you want the bot locked to you
 - an OpenRouter API key
-- optional: `REASONING_EFFORT` to control GPT-5.5 thinking depth (`high` by default; valid values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`)
+- optional: `MODEL_PRIMARY` to override GPT-5.6 Sol (`openai/gpt-5.6` by default)
+- optional: `REASONING_EFFORT` to control thinking depth (`high` by default; valid values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`)
 - optional: `BOT_REPLY_COOLDOWN_SECONDS` to limit how often Colin replies to bot-origin messages in a channel
 - optional: `MAX_REPLY_TOKENS` to control max model output tokens (default `2500`)
 - optional: `ENABLE_WEB_SEARCH` to turn OpenRouter web search on or off (`true` by default)

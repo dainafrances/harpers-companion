@@ -80,6 +80,7 @@ class RouterContextTests(unittest.IsolatedAsyncioTestCase):
             {"role": "system", "content": router.HISTORY_INTERPRETATION_RULES},
         )
         self.assertIn("ROOM CONTEXT RULES", sent_messages[2]["content"])
+        self.assertEqual(create.await_args.kwargs["model"], "openai/gpt-5.6")
         self.assertEqual(create.await_args.kwargs["reasoning_effort"], "high")
         self.assertEqual(create.await_args.kwargs["tools"][0]["type"], "openrouter:web_search")
 

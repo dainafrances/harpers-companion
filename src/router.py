@@ -23,6 +23,7 @@ HISTORY INTERPRETATION RULES (non-negotiable):
 OBSERVED_CONTEXT_OPEN = "[OBSERVED DIALOGUE — CONTEXT ONLY]"
 OBSERVED_CONTEXT_CLOSE = "[END OBSERVED DIALOGUE]"
 SUPPORTED_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+DEFAULT_MODEL = "openai/gpt-5.6"
 
 
 def _reply_token_limit() -> int:
@@ -115,7 +116,7 @@ async def generate_companion_reply(
     image_urls: list[str] | None = None,
     discord_retrieval_context: str | None = None,
 ) -> str:
-    model = os.getenv("MODEL_PRIMARY", "openai/gpt-5.5")
+    model = os.getenv("MODEL_PRIMARY", DEFAULT_MODEL).strip()
 
     messages: list[dict[str, Any]] = [
         {
