@@ -91,7 +91,7 @@ chunks from a long reply. You can also supply text directly with the optional
 
 Add `ELEVENLABS_API_KEY` to Railway as a secret variable. Do not commit the key to
 GitHub. The default voice is `uTTVBQHpmHNum2rmocA4`, using
-`eleven_multilingual_v2` and `mp3_44100_128`. Set `BOT_OWNER_DISCORD_ID` to keep
+`eleven_v3` and `mp3_44100_128`. Set `BOT_OWNER_DISCORD_ID` to keep
 the command owner-only and prevent other server members from spending the account's
 ElevenLabs credits.
 

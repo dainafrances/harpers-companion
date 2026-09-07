@@ -49,7 +49,7 @@ class ElevenLabsVoiceTests(unittest.TestCase):
             json.loads(request.data),
             {
                 "text": "Hello, Goose.",
-                "model_id": "eleven_multilingual_v2",
+                "model_id": "eleven_v3",
             },
         )
         self.assertEqual(captured["timeout"], 90.0)

@@ -6,7 +6,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 
-DEFAULT_MODEL_ID = "eleven_multilingual_v2"
+DEFAULT_MODEL_ID = "eleven_v3"
 DEFAULT_OUTPUT_FORMAT = "mp3_44100_128"
 
 
