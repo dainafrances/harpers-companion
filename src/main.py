@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import io
 import os
 import random
 import re
@@ -13,6 +15,7 @@ from dotenv import load_dotenv
 
 from . import discord_recall
 from . import document_reader
+from . import elevenlabs_voice
 from . import memory
 from . import room_context
 from .router import generate_companion_reply
@@ -32,6 +35,19 @@ DISCORD_GUILD_IDS_RAW = os.getenv("DISCORD_GUILD_IDS", "").strip()
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
 
 MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-5.6").strip()
+
+# ElevenLabs powers the optional /voice command. The API key must be supplied
+# as a deployment secret; the voice ID is safe to keep as a configurable default.
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
+ELEVENLABS_VOICE_ID = os.getenv(
+    "ELEVENLABS_VOICE_ID",
+    "uTTVBQHpmHNum2rmocA4",
+).strip()
+ELEVENLABS_MODEL_ID = os.getenv(
+    "ELEVENLABS_MODEL_ID",
+    elevenlabs_voice.DEFAULT_MODEL_ID,
+).strip()
+VOICE_MAX_CHARS = max(1, int(os.getenv("VOICE_MAX_CHARS", "5000")))
 
 # Optional channel restriction list. Leave blank to allow all channels
 # inside the allowed guild(s).
@@ -217,6 +233,31 @@ async def send_long_message(
         except discord.HTTPException as e:
             _debug_log(f"HTTPException while sending message: {e}")
             raise
+
+
+async def _latest_bot_message_text(
+    channel: discord.abc.Messageable | None,
+    *,
+    history_limit: int = 20,
+) -> str | None:
+    """Return the latest contiguous message (including Discord-split chunks)."""
+    if channel is None or bot.user is None or not hasattr(channel, "history"):
+        return None
+
+    chunks: list[str] = []
+    async for message in channel.history(limit=history_limit):
+        if getattr(message.author, "id", None) != bot.user.id:
+            if chunks:
+                break
+            continue
+
+        content = message.content or ""
+        if content.strip():
+            chunks.append(content)
+
+    if not chunks:
+        return None
+    return "".join(reversed(chunks)).strip()
 
 
 def _message_mentions_self_naturally(message: discord.Message) -> bool:
@@ -790,6 +831,64 @@ async def journal_now(interaction: discord.Interaction, note: str | None = None)
     content = note.strip() if note else "Manual journal pulse. Online, present, and waiting."
     memory.save_journal_entry(title="Manual journal pulse", content=content)
     await interaction.response.send_message("Journal entry saved.", ephemeral=True)
+
+
+@bot.tree.command(name="voice", description="Hear Colin's latest message spoken aloud.")
+@app_commands.describe(text="Optional text to speak; leave blank for Colin's latest message.")
+async def voice_command(interaction: discord.Interaction, text: str | None = None) -> None:
+    if owner_id is not None and interaction.user.id != owner_id:
+        await interaction.response.send_message(
+            "This command is private for Goose right now.",
+            ephemeral=True,
+        )
+        return
+
+    if not ELEVENLABS_API_KEY:
+        await interaction.response.send_message(
+            "Voice is wired in, but `ELEVENLABS_API_KEY` is not configured in Railway yet.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+    spoken_text = text.strip() if text else await _latest_bot_message_text(interaction.channel)
+    if not spoken_text:
+        await interaction.followup.send(
+            "I couldn't find a recent message of mine to read aloud.",
+            ephemeral=True,
+        )
+        return
+
+    spoken_text = discord.utils.remove_markdown(spoken_text).strip()
+    if len(spoken_text) > VOICE_MAX_CHARS:
+        await interaction.followup.send(
+            f"That message is too long for one recording ({len(spoken_text):,} characters; "
+            f"the limit is {VOICE_MAX_CHARS:,}).",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        audio = await asyncio.to_thread(
+            elevenlabs_voice.create_speech,
+            spoken_text,
+            api_key=ELEVENLABS_API_KEY,
+            voice_id=ELEVENLABS_VOICE_ID,
+            model_id=ELEVENLABS_MODEL_ID,
+        )
+    except (ValueError, elevenlabs_voice.VoiceGenerationError) as error:
+        _debug_log(f"Voice generation failed: {error}")
+        await interaction.followup.send(
+            "I couldn't make that recording. Check the Railway logs for the ElevenLabs error.",
+            ephemeral=True,
+        )
+        return
+
+    recording = discord.File(
+        io.BytesIO(audio),
+        filename=f"colin-voice-{interaction.id}.mp3",
+    )
+    await interaction.followup.send("🔊 Colin's voice", file=recording)
 
 
 def main() -> None:

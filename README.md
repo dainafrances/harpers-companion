@@ -15,7 +15,7 @@ A minimal Discord bot starter for a private, text-first Colin build.
 - ignores duplicate deliveries of the same Discord message
 - adds a short channel cooldown for bot-origin replies to reduce burst fan-out
 - writes a nightly heartbeat journal entry
-- includes slash commands for `/ping`, `/status`, and `/journal_now`
+- includes slash commands for `/ping`, `/status`, `/journal_now`, and `/voice`
 - uses OpenRouter as the model transport through the OpenAI-compatible client
 - reads supported document attachments and can search the web with source links
 
@@ -43,6 +43,7 @@ You will need:
 - your Discord server ID (`DISCORD_GUILD_ID`) for fast slash-command sync
 - your own Discord user ID (`BOT_OWNER_DISCORD_ID`) if you want the bot locked to you
 - an OpenRouter API key
+- an ElevenLabs API key if you want `/voice` recordings
 - optional: `MODEL_PRIMARY` to override GPT-5.6 Sol (`openai/gpt-5.6` by default)
 - optional: `REASONING_EFFORT` to control thinking depth (`high` by default; valid values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`)
 - optional: `BOT_REPLY_COOLDOWN_SECONDS` to limit how often Colin replies to bot-origin messages in a channel
@@ -51,6 +52,7 @@ You will need:
 - optional: `MAX_DOCUMENT_BYTES` and `MAX_DOCUMENT_CHARS` to cap document processing
 - optional: `DISCORD_RECALL_GUILD_IDS` and `DISCORD_RECALL_CHANNEL_IDS` to explicitly opt guilds/channels into the recall index
 - optional: `ROOM_CONTEXT_GUILD_LABELS` and `ROOM_CONTEXT_CHANNEL_LABELS` to label rooms with trusted modes/names
+- optional: `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL_ID`, and `VOICE_MAX_CHARS` to override the `/voice` defaults
 
 ## Bot `@everyone` questions
 
@@ -79,6 +81,19 @@ size limit are not processed. Image attachments continue to use the existing vis
 Web research uses OpenRouter's `openrouter:web_search` server tool. It is enabled by
 default, and Colin can include source links in his reply. Set `ENABLE_WEB_SEARCH=false`
 to disable it for a deployment.
+
+## ElevenLabs voice recordings
+
+The `/voice` command creates an MP3 with ElevenLabs. With no text option, it reads
+Colin's most recent message in the current Discord channel, including consecutive
+chunks from a long reply. You can also supply text directly with the optional
+`text` field. Markdown formatting is removed before speech generation.
+
+Add `ELEVENLABS_API_KEY` to Railway as a secret variable. Do not commit the key to
+GitHub. The default voice is `uTTVBQHpmHNum2rmocA4`, using
+`eleven_multilingual_v2` and `mp3_44100_128`. Set `BOT_OWNER_DISCORD_ID` to keep
+the command owner-only and prevent other server members from spending the account's
+ElevenLabs credits.
 
 The code requests Discord's message content intent with `intents.message_content = True`, but code alone cannot make Discord deliver messages Colin is not allowed to see.
 
