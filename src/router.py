@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+from dataclasses import dataclass
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -24,6 +26,14 @@ OBSERVED_CONTEXT_OPEN = "[OBSERVED DIALOGUE — CONTEXT ONLY]"
 OBSERVED_CONTEXT_CLOSE = "[END OBSERVED DIALOGUE]"
 SUPPORTED_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 DEFAULT_MODEL = "openai/gpt-5.6"
+
+
+@dataclass(frozen=True)
+class CompanionResponse:
+    """Actions the companion chose for the current Discord message."""
+
+    reply_text: str | None = None
+    reaction_emoji: str | None = None
 
 
 def _reply_token_limit() -> int:
@@ -52,6 +62,51 @@ def _web_search_tool() -> list[dict[str, Any]]:
         "type": "openrouter:web_search",
         "parameters": {"max_results": 5},
     }]
+
+
+def _reaction_tool() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "react_to_message",
+            "description": (
+                "Optionally add one emoji reaction to the current Discord message. "
+                "Call this only when you independently want to react; not calling it is always valid. "
+                "You may react without writing a reply. Prefer a standard Unicode emoji."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "emoji": {
+                        "type": "string",
+                        "description": "One standard Unicode emoji to add as the reaction.",
+                    }
+                },
+                "required": ["emoji"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _available_tools() -> list[dict[str, Any]]:
+    return [*_web_search_tool(), _reaction_tool()]
+
+
+def _requested_reaction(tool_calls: Any) -> str | None:
+    """Return the first well-formed reaction request, ignoring unrelated tools."""
+    for tool_call in tool_calls or []:
+        function = getattr(tool_call, "function", None)
+        if function is None or getattr(function, "name", None) != "react_to_message":
+            continue
+        try:
+            arguments = json.loads(getattr(function, "arguments", "") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        emoji = arguments.get("emoji")
+        if isinstance(emoji, str) and emoji.strip():
+            return emoji.strip()
+    return None
 
 
 def _append_citations(text: str, annotations: Any) -> str:
@@ -115,7 +170,7 @@ async def generate_companion_reply(
     speaker_is_owner: bool,
     image_urls: list[str] | None = None,
     discord_retrieval_context: str | None = None,
-) -> str:
+) -> CompanionResponse:
     model = os.getenv("MODEL_PRIMARY", DEFAULT_MODEL).strip()
 
     messages: list[dict[str, Any]] = [
@@ -160,9 +215,12 @@ async def generate_companion_reply(
         temperature=0.60,
         max_tokens=_reply_token_limit(),
         reasoning_effort=_reasoning_effort(),
-        tools=_web_search_tool(),
+        tools=_available_tools(),
     )
 
     message = response.choices[0].message
     text = _append_citations(message.content or "", getattr(message, "annotations", None))
-    return text.strip() or "UNKNOWN. I lost the thread for a second."
+    return CompanionResponse(
+        reply_text=text.strip() or None,
+        reaction_emoji=_requested_reaction(getattr(message, "tool_calls", None)),
+    )
