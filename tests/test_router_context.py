@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import unittest
 from types import SimpleNamespace
@@ -67,7 +68,7 @@ class RouterContextTests(unittest.IsolatedAsyncioTestCase):
                 speaker_is_owner=True,
             )
 
-        self.assertEqual(reply, "Reply")
+        self.assertEqual(reply, router.CompanionResponse(reply_text="Reply"))
         build_prompt.assert_called_once_with(
             is_dm=False,
             speaker_name="Daina",
@@ -82,7 +83,47 @@ class RouterContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ROOM CONTEXT RULES", sent_messages[2]["content"])
         self.assertEqual(create.await_args.kwargs["model"], "openai/gpt-5.6")
         self.assertEqual(create.await_args.kwargs["reasoning_effort"], "high")
-        self.assertEqual(create.await_args.kwargs["tools"][0]["type"], "openrouter:web_search")
+        tools = create.await_args.kwargs["tools"]
+        self.assertEqual(tools[0]["type"], "openrouter:web_search")
+        self.assertEqual(tools[1]["function"]["name"], "react_to_message")
+
+    async def test_model_can_choose_reaction_without_written_reply(self) -> None:
+        tool_call = SimpleNamespace(
+            function=SimpleNamespace(
+                name="react_to_message",
+                arguments=json.dumps({"emoji": "💚"}),
+            )
+        )
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))]
+            )
+        )
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        with (
+            patch.object(router, "_client", fake_client),
+            patch.object(router, "build_system_prompt", return_value="IDENTITY"),
+        ):
+            response = await router.generate_companion_reply(
+                user_text="Hello",
+                history=[],
+                latest_journal=None,
+                is_dm=False,
+                speaker_name="Daina",
+                speaker_is_owner=True,
+            )
+
+        self.assertEqual(response, router.CompanionResponse(reaction_emoji="💚"))
+
+    def test_no_reaction_tool_call_means_no_reaction(self) -> None:
+        self.assertIsNone(router._requested_reaction(None))
+        malformed = SimpleNamespace(
+            function=SimpleNamespace(name="react_to_message", arguments="not-json")
+        )
+        self.assertIsNone(router._requested_reaction([malformed]))
 
     def test_citations_are_appended_once(self) -> None:
         annotations = [

@@ -76,9 +76,14 @@ class FakeMessage:
             else None
         )
         self.replies: list[tuple[str, dict]] = []
+        self.reactions: list[object] = []
+        self.added_reactions: list[str] = []
 
     async def reply(self, content: str, **kwargs) -> None:
         self.replies.append((content, kwargs))
+
+    async def add_reaction(self, emoji: str) -> None:
+        self.added_reactions.append(emoji)
 
 
 class FakeBot:
@@ -139,6 +144,47 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(generate.await_args.kwargs["speaker_name"], "Daina")
         self.assertTrue(generate.await_args.kwargs["speaker_is_owner"])
+
+    async def test_reaction_only_response_adds_reaction_without_message(self) -> None:
+        message = FakeMessage(29, self.human, "Good news", channel=self.channel)
+        response = main.CompanionResponse(reaction_emoji="🎉")
+        with patch.object(main, "generate_companion_reply", new=AsyncMock(return_value=response)):
+            await main.handle_chat_message(message, "Good news", is_dm=False, source="human-direct")
+
+        self.assertEqual(message.added_reactions, ["🎉"])
+        self.assertEqual(message.replies, [])
+        self.assertEqual(self.channel.sent, [])
+        self.assertFalse(any(item["role"] == "assistant" for item in self.saved_messages()))
+
+    async def test_existing_identical_reaction_is_not_added_again(self) -> None:
+        message = FakeMessage(30, self.human, "Already seen", channel=self.channel)
+        message.reactions = [SimpleNamespace(emoji="💚", me=True)]
+
+        added = await main.add_optional_reaction(message, "💚")
+
+        self.assertFalse(added)
+        self.assertEqual(message.added_reactions, [])
+
+    async def test_bot_does_not_react_to_its_own_message(self) -> None:
+        message = FakeMessage(31, self.colin, "My message", channel=self.channel)
+
+        added = await main.add_optional_reaction(message, "👍")
+
+        self.assertFalse(added)
+        self.assertEqual(message.added_reactions, [])
+
+    async def test_empty_response_can_choose_to_do_nothing(self) -> None:
+        message = FakeMessage(32, self.human, "Quiet moment", channel=self.channel)
+        with patch.object(
+            main,
+            "generate_companion_reply",
+            new=AsyncMock(return_value=main.CompanionResponse()),
+        ):
+            await main.handle_chat_message(message, "Quiet moment", is_dm=False, source="human-direct")
+
+        self.assertEqual(message.added_reactions, [])
+        self.assertEqual(message.replies, [])
+        self.assertEqual(self.channel.sent, [])
 
     async def test_unaddressed_companion_is_observed_without_reply(self) -> None:
         message = FakeMessage(11, self.ben, "Colin is plain text only", channel=self.channel)
