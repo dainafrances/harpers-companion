@@ -18,7 +18,7 @@ from . import document_reader
 from . import elevenlabs_voice
 from . import memory
 from . import room_context
-from .router import generate_companion_reply
+from .router import CompanionResponse, generate_companion_reply
 
 load_dotenv()
 
@@ -34,7 +34,7 @@ DISCORD_GUILD_IDS_RAW = os.getenv("DISCORD_GUILD_IDS", "").strip()
 # Backward compatibility with the old single-guild env var
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
 
-MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-5.6").strip()
+MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-5.6-sol").strip()
 
 # ElevenLabs powers the optional /voice command. The API key must be supplied
 # as a deployment secret; the voice ID is safe to keep as a configurable default.
@@ -148,6 +148,9 @@ self_name_aliases = {
 bot_to_bot_cooldowns: set[int] = set()
 # Channel-level time cooldown remains as a second anti-loop safety layer.
 bot_reply_cooldown_by_channel: dict[int, float] = {}
+# Process-local race guard. Discord's Reaction.me remains the source of truth
+# across restarts, while this prevents concurrent handlers from double-attempting.
+reaction_attempts_in_flight: set[tuple[int, int, str]] = set()
 
 
 # ----------------------------
@@ -233,6 +236,80 @@ async def send_long_message(
         except discord.HTTPException as e:
             _debug_log(f"HTTPException while sending message: {e}")
             raise
+
+
+def _valid_reaction_emoji(emoji: str) -> bool:
+    """Apply conservative bounds; Discord performs final Unicode validation."""
+    return bool(
+        emoji
+        and emoji == emoji.strip()
+        and len(emoji) <= 32
+        and not any(char.isspace() for char in emoji)
+    )
+
+
+async def add_optional_reaction(message: discord.Message, emoji: str) -> bool:
+    """Add a model-selected reaction once, without exposing message lookup to the model."""
+    companion = getattr(bot.user, "display_name", None) or getattr(bot.user, "name", "unknown")
+    channel_id = message.channel.id
+    message_id = message.id
+    author_id = getattr(message.author, "id", None)
+    bot_id = getattr(bot.user, "id", None)
+
+    if bot_id is not None and author_id == bot_id:
+        _debug_log(
+            f"Reaction skipped companion={companion} discord_message_id={message_id} "
+            f"channel_id={channel_id} emoji={emoji!r} reason=self-authored-message."
+        )
+        return False
+    if not _valid_reaction_emoji(emoji):
+        _debug_log(
+            f"Reaction rejected companion={companion} discord_message_id={message_id} "
+            f"channel_id={channel_id} emoji={emoji!r} reason=invalid-emoji."
+        )
+        return False
+
+    key = (channel_id, message_id, emoji)
+    if key in reaction_attempts_in_flight or any(
+        str(getattr(reaction, "emoji", "")) == emoji and bool(getattr(reaction, "me", False))
+        for reaction in (getattr(message, "reactions", None) or [])
+    ):
+        _debug_log(
+            f"Reaction skipped companion={companion} discord_message_id={message_id} "
+            f"channel_id={channel_id} emoji={emoji!r} reason=already-reacted."
+        )
+        return False
+
+    reaction_attempts_in_flight.add(key)
+    _debug_log(
+        f"Reaction attempted companion={companion} discord_message_id={message_id} "
+        f"channel_id={channel_id} emoji={emoji!r}."
+    )
+    try:
+        await message.add_reaction(emoji)
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException) as error:
+        _debug_log(
+            f"Reaction rejected by Discord companion={companion} discord_message_id={message_id} "
+            f"channel_id={channel_id} emoji={emoji!r} error={type(error).__name__}."
+        )
+        return False
+    else:
+        _debug_log(
+            f"Reaction accepted by Discord companion={companion} discord_message_id={message_id} "
+            f"channel_id={channel_id} emoji={emoji!r}."
+        )
+        return True
+    finally:
+        reaction_attempts_in_flight.discard(key)
+
+
+def _response_reactions(response: object) -> tuple[str, ...]:
+    """Read new or original response objects safely during rolling deployments."""
+    emojis = getattr(response, "reaction_emojis", None)
+    if emojis is not None:
+        return tuple(emojis)
+    emoji = getattr(response, "reaction_emoji", None)
+    return (emoji,) if emoji else ()
 
 
 async def _latest_bot_message_text(
@@ -533,7 +610,7 @@ async def handle_chat_message(
                 getattr(message.author, "display_name", None)
                 or getattr(message.author, "name", "unknown")
             )
-            reply = await generate_companion_reply(
+            response = await generate_companion_reply(
                 user_text=payload,
                 history=history,
                 latest_journal=latest_journal,
@@ -544,25 +621,38 @@ async def handle_chat_message(
                 discord_retrieval_context=discord_retrieval_context,
             )
 
-        # Save assistant reply
-        memory.save_message(
-            channel_id=message.channel.id,
-            user_id=bot.user.id if bot.user else 0,
-            role="assistant",
-            content=reply,
-            source=source,
-        )
+        # String compatibility keeps older tests/extensions safe while callers
+        # migrate to the structured response.
+        if isinstance(response, str):
+            response = CompanionResponse(reply_text=response)
 
-        chunk_count = len(split_for_discord(reply))
-        _debug_log(
-            f"Sending reply for Discord message {message.id} "
-            f"source={source} length={len(reply)} chunks={chunk_count}."
-        )
-        await send_long_message(
-            message.channel,
-            reply,
-            reply_to=message if reply_to_trigger else None,
-        )
+        reaction_emojis = _response_reactions(response)
+        for emoji in reaction_emojis:
+            await add_optional_reaction(message, emoji)
+
+        if response.reply_text:
+            memory.save_message(
+                channel_id=message.channel.id,
+                user_id=bot.user.id if bot.user else 0,
+                role="assistant",
+                content=response.reply_text,
+                source=source,
+            )
+
+            chunk_count = len(split_for_discord(response.reply_text))
+            _debug_log(
+                f"Sending reply for Discord message {message.id} "
+                f"source={source} length={len(response.reply_text)} chunks={chunk_count}."
+            )
+            await send_long_message(
+                message.channel,
+                response.reply_text,
+                reply_to=message if reply_to_trigger else None,
+            )
+        elif not reaction_emojis:
+            _debug_log(
+                f"No reply or reaction chosen for Discord message {message.id} source={source}."
+            )
 
     except discord.Forbidden:
         _debug_log("ERROR: Missing permissions to speak in this channel.")

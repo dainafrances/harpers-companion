@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import unittest
 from types import SimpleNamespace
@@ -12,6 +13,15 @@ router = importlib.import_module("src.router")
 
 
 class RouterContextTests(unittest.IsolatedAsyncioTestCase):
+    def test_companion_response_accepts_singular_and_plural_reaction_fields(self) -> None:
+        original = router.CompanionResponse(reaction_emoji="💚")
+        current = router.CompanionResponse(reaction_emojis=("😂", "🫎"))
+
+        self.assertEqual(original.reaction_emojis, ("💚",))
+        self.assertEqual(original.reaction_emoji, "💚")
+        self.assertEqual(current.reaction_emojis, ("😂", "🫎"))
+        self.assertEqual(current.reaction_emoji, "😂")
+
     def test_observed_history_is_wrapped_and_source_metadata_is_removed(self) -> None:
         history = [
             {
@@ -67,7 +77,7 @@ class RouterContextTests(unittest.IsolatedAsyncioTestCase):
                 speaker_is_owner=True,
             )
 
-        self.assertEqual(reply, "Reply")
+        self.assertEqual(reply, router.CompanionResponse(reply_text="Reply"))
         build_prompt.assert_called_once_with(
             is_dm=False,
             speaker_name="Daina",
@@ -80,9 +90,75 @@ class RouterContextTests(unittest.IsolatedAsyncioTestCase):
             {"role": "system", "content": router.HISTORY_INTERPRETATION_RULES},
         )
         self.assertIn("ROOM CONTEXT RULES", sent_messages[2]["content"])
-        self.assertEqual(create.await_args.kwargs["model"], "openai/gpt-5.6")
+        self.assertEqual(create.await_args.kwargs["model"], "openai/gpt-5.6-sol")
         self.assertEqual(create.await_args.kwargs["reasoning_effort"], "high")
-        self.assertEqual(create.await_args.kwargs["tools"][0]["type"], "openrouter:web_search")
+        tools = create.await_args.kwargs["tools"]
+        self.assertEqual(tools[0]["type"], "openrouter:web_search")
+        self.assertEqual(tools[1]["function"]["name"], "react_to_message")
+
+    async def test_model_reactions_are_followed_by_written_reply(self) -> None:
+        tool_call = SimpleNamespace(
+            id="call-1",
+            function=SimpleNamespace(
+                name="react_to_message",
+                arguments=json.dumps({"emojis": ["💚", "🫎"]}),
+            )
+        )
+        create = AsyncMock(
+            side_effect=[
+                SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))]
+                ),
+                SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="Reply after reacting"))]
+                ),
+            ]
+        )
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        with (
+            patch.object(router, "_client", fake_client),
+            patch.object(router, "build_system_prompt", return_value="IDENTITY"),
+        ):
+            response = await router.generate_companion_reply(
+                user_text="Hello",
+                history=[],
+                latest_journal=None,
+                is_dm=False,
+                speaker_name="Daina",
+                speaker_is_owner=True,
+            )
+
+        self.assertEqual(
+            response,
+            router.CompanionResponse(
+                reply_text="Reply after reacting",
+                reaction_emojis=("💚", "🫎"),
+            ),
+        )
+        self.assertEqual(create.await_count, 2)
+        follow_up = create.await_args_list[1].kwargs["messages"][-2:]
+        self.assertEqual(follow_up[0]["tool_calls"][0]["id"], "call-1")
+        self.assertEqual(follow_up[1]["tool_call_id"], "call-1")
+        self.assertNotIn(router._reaction_tool(), create.await_args_list[1].kwargs["tools"])
+
+    def test_no_reaction_tool_call_means_no_reaction(self) -> None:
+        self.assertEqual(router._requested_reactions(None), ())
+        malformed = SimpleNamespace(
+            function=SimpleNamespace(name="react_to_message", arguments="not-json")
+        )
+        self.assertEqual(router._requested_reactions([malformed]), ())
+
+    def test_reactions_are_deduplicated_and_limited(self) -> None:
+        tool_call = SimpleNamespace(
+            function=SimpleNamespace(
+                name="react_to_message",
+                arguments=json.dumps({"emojis": ["💚", "💚", "😂", "🫎", "🎉"]}),
+            )
+        )
+        self.assertEqual(router._requested_reactions([tool_call]), ("💚", "😂", "🫎"))
 
     def test_citations_are_appended_once(self) -> None:
         annotations = [
