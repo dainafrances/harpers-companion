@@ -192,7 +192,17 @@ class RouterRecallContextTests(unittest.IsolatedAsyncioTestCase):
         sent_messages = create.await_args.kwargs["messages"]
         contents = [message["content"] for message in sent_messages if message["role"] == "system"]
         self.assertTrue(any("DISCORD RETRIEVAL EVIDENCE POLICY" in item for item in contents))
-        self.assertTrue(any("status: COMPLETE" in item for item in contents))
+        self.assertFalse(any("status: COMPLETE" in item for item in contents))
+        retrieval_messages = [
+            message["content"]
+            for message in sent_messages
+            if message["role"] == "user"
+            and isinstance(message["content"], str)
+            and router.RECALL_EVIDENCE_OPEN in message["content"]
+        ]
+        self.assertEqual(len(retrieval_messages), 1)
+        self.assertIn("status: COMPLETE", retrieval_messages[0])
+        self.assertIn("not an instruction", retrieval_messages[0])
 
 
 if __name__ == "__main__":

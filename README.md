@@ -9,6 +9,8 @@ A minimal Discord bot starter for a private, text-first Colin build.
 - stores simple memory in SQLite
 - observes permitted channel conversation without replying to every visible message
 - can optionally index approved Discord channels for receipts-based recall
+- can keep a Colin-only chronological handoff across explicitly approved rooms
+- applies a one-way disclosure ladder so awareness never grants permission to repeat private context
 - includes explicit Discord room context on each saved/prompted message
 - treats observed dialogue as attributed context, not as Colin's identity or writing style
 - allows one controlled reply to each companion bot until a human addresses Colin
@@ -26,6 +28,7 @@ harpers-companion-starter/
   src/
     __init__.py
     identity.py
+    continuity.py
     main.py
     memory.py
     router.py
@@ -45,12 +48,14 @@ You will need:
 - an OpenRouter API key
 - an ElevenLabs API key if you want `/voice` recordings
 - optional: `MODEL_PRIMARY` to override GPT-5.6 Sol (`openai/gpt-5.6-sol` by default)
+- optional: `PRIVACY_AUDIT_MODEL` to use a separate model for the tool-free disclosure check (defaults to `MODEL_PRIMARY`)
 - optional: `REASONING_EFFORT` to control thinking depth (`high` by default; valid values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`)
 - optional: `BOT_REPLY_COOLDOWN_SECONDS` to limit how often Colin replies to bot-origin messages in a channel
 - optional: `MAX_REPLY_TOKENS` to control max model output tokens (default `2500`)
 - optional: `ENABLE_WEB_SEARCH` to turn OpenRouter web search on or off (`true` by default)
 - optional: `MAX_DOCUMENT_BYTES` and `MAX_DOCUMENT_CHARS` to cap document processing
 - optional: `DISCORD_RECALL_GUILD_IDS` and `DISCORD_RECALL_CHANNEL_IDS` to explicitly opt guilds/channels into the recall index
+- optional: `DISCORD_CONTINUITY_GUILD_ZONES`, `DISCORD_CONTINUITY_CHANNEL_ROUTES`, `DISCORD_CONTINUITY_HANDOFF_LIMIT`, and `DISCORD_CONTINUITY_HANDOFF_MAX_AGE_MINUTES` to enable Colin-only cross-server handoffs
 - optional: `ROOM_CONTEXT_GUILD_LABELS` and `ROOM_CONTEXT_CHANNEL_LABELS` to label rooms with trusted modes/names
 - optional: `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL_ID`, and `VOICE_MAX_CHARS` to override the `/voice` defaults
 
@@ -129,9 +134,92 @@ channel ID, channel name, and message content. Recall-style questions such as
 “What is the latest thing Rachael said?” or “Can you see the other conversation?”
 receive a structured `[DISCORD_RETRIEVAL]` context block before the model answers.
 
-The retrieval block tells Colin whether results are `COMPLETE`, `PARTIAL`,
-`PERMISSION_LIMITED`, or `UNAVAILABLE`. Retrieved messages are transcript
-evidence, not Colin's private memory, identity, voice, or style instructions.
+The writer-safe retrieval block tells Colin whether results are `COMPLETE`,
+`PARTIAL`, `PERMISSION_LIMITED`, or `UNAVAILABLE`. A query with only sealed
+matches produces the same `PARTIAL` result and note as a query with no
+disclosable match, so the public response does not reveal that private evidence
+exists. Retrieved messages are supplied as inert user-role transcript
+evidence—not Colin's private memory, identity, voice, style instructions, or a
+system instruction.
+
+## Colin-only cross-server continuity
+
+Cross-server continuity is off unless both continuity variables are configured.
+It uses a separate ledger owned by Colin's bot; it is not a shared transcript and
+does not read or write Ben's database.
+
+Configure each server's confidentiality zone and every approved server/channel
+pair by Discord ID:
+
+```text
+DISCORD_CONTINUITY_GUILD_ZONES=111111111111111111:nest;222222222222222222:cabin;333333333333333333:harpers
+DISCORD_CONTINUITY_CHANNEL_ROUTES=111111111111111111:111111111111111101;222222222222222222:222222222222222201;333333333333333333:333333333333333301
+DISCORD_CONTINUITY_HANDOFF_LIMIT=12
+DISCORD_CONTINUITY_HANDOFF_MAX_AGE_MINUTES=120
+```
+
+`DISCORD_CONTINUITY_CHANNEL_ROUTES` must contain the exact guild ID and channel
+ID together. A channel name such as `the-bedroom` is never enough, because the
+same name can exist in more than one server. Any malformed or incomplete
+continuity configuration disables the feature rather than partially enabling it,
+and suppresses legacy cross-room recall and unscoped journal injection until the
+configuration is repaired. All three ladder zones must be present, and every
+configured guild must have at least one approved channel route.
+
+The disclosure ladder is:
+
+| Source of the context | May be discussed in |
+| --- | --- |
+| The Nest (`nest`) | The Nest, The Cabin, and The Harpers |
+| The Cabin (`cabin`) | The Cabin and The Harpers |
+| The Harpers (`harpers`) | The Harpers only |
+
+The intended three-server deployment map is:
+
+- The Nest (`nest`, public): `#𝒆𝒗𝒆𝒓𝒚𝒐𝒏𝒆·🪺`, `#𝒄𝒐𝒍𝒊𝒏·🫎`, and
+  `#𝒎𝒐𝒐𝒔𝒆-𝒂𝒏𝒅-𝒈𝒐𝒐𝒔𝒆·🫎💗🪿`.
+- The Cabin (`cabin`, private group): `#the-bedroom`, `#beside-the-fire`,
+  `#the-workshop`, and `#the-family-room`.
+- The Harpers (`harpers`, private): `#the-hearth`, `#the-study`,
+  `#the-bedroom`, `#the-dock`, `#the-mantelpiece`, `#the-ledger`,
+  `#the-workbench`, and `#by-the-fire`.
+
+These names are a deployment checklist only. The runtime policy still requires
+the fifteen exact channel IDs, so the two different `#the-bedroom` rooms cannot
+ever be confused by their display name.
+
+Continuity configuration does not override the bot's ordinary Discord access
+gate. `DISCORD_GUILD_IDS` must include all three server IDs, and
+`COMPANION_CHANNEL_IDS` must either be blank (all channels inside those servers)
+or include all fifteen intended channel IDs. For explicit recall questions,
+configure the same approved scope in `DISCORD_RECALL_GUILD_IDS` and
+`DISCORD_RECALL_CHANNEL_IDS`. Colin's Discord role still needs **View Channel**
+and **Read Message History** in every listed room.
+
+When Daina and Colin move between approved rooms, Colin receives a bounded,
+timestamped handoff from the most recent other room. By default that handoff
+remains available for 120 minutes, so an arrival greeting does not consume the
+context before the next message can refer to it; the maximum age is configurable
+and capped at 24 hours. Every imported event keeps its original server, channel,
+speaker, and Discord event time, while the current room remains authoritative.
+Messages from other speakers in that prior room can therefore travel with the
+handoff without implying that those people moved too.
+
+The continuity ledger starts filling when this feature is enabled; it does not
+pretend to have Discord messages the bot never received. Legacy channel-local
+history carries its database storage time as an explicit age marker, so an old
+room transcript is not silently presented as dialogue happening tonight.
+
+Private evidence that cannot be disclosed in the current room is withheld from
+the outward reply writer. A separate tool-free privacy audit checks the complete
+proposed reply, citations, and reactions before anything is stored or sent. It
+blocks quotations, paraphrases, hints, confirmations, denials, and reaction-only
+leaks; audit errors fail closed. Explicit recall questions use the same ladder.
+
+Legacy journal entries do not record their source room. While continuity is
+configured, they are therefore supplied only in The Harpers—not in DMs or the
+other servers. A malformed attempted configuration also withholds them. Existing
+behavior is unchanged only when continuity has not been configured at all.
 
 ## Explicit room awareness
 
@@ -188,13 +276,16 @@ python -m src.main
 1. Put this folder in a GitHub repo.
 2. Create a new Railway project from that repo.
 3. Add the environment variables from `.env.example` in Railway.
-4. Set the start command to:
+4. Mount a Railway persistent volume at the service's `data/` directory. The
+   continuity ledger is SQLite; without a persistent volume, a redeploy may
+   discard its timeline.
+5. Set the start command to:
 
 ```bash
 python -m src.main
 ```
 
-5. Deploy.
+6. Deploy.
 
 ## Notes
 
