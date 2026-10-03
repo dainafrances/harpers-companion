@@ -37,6 +37,14 @@ class CompanionResponse:
     reaction_emojis: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class CompanionResponse:
+    """Actions the companion chose for the current Discord message."""
+
+    reply_text: str | None = None
+    reaction_emoji: str | None = None
+
+
 def _reply_token_limit() -> int:
     raw = os.getenv("MAX_REPLY_TOKENS", "2500").strip()
     try:
