@@ -44,7 +44,7 @@ You will need:
 - your own Discord user ID (`BOT_OWNER_DISCORD_ID`) if you want the bot locked to you
 - an OpenRouter API key
 - an ElevenLabs API key if you want `/voice` recordings
-- optional: `MODEL_PRIMARY` to override GPT-5.6 Sol (`openai/gpt-5.6` by default)
+- optional: `MODEL_PRIMARY` to override GPT-5.6 Sol (`openai/gpt-5.6-sol` by default)
 - optional: `REASONING_EFFORT` to control thinking depth (`high` by default; valid values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`)
 - optional: `BOT_REPLY_COOLDOWN_SECONDS` to limit how often Colin replies to bot-origin messages in a channel
 - optional: `MAX_REPLY_TOKENS` to control max model output tokens (default `2500`)

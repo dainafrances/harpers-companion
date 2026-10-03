@@ -34,7 +34,7 @@ DISCORD_GUILD_IDS_RAW = os.getenv("DISCORD_GUILD_IDS", "").strip()
 # Backward compatibility with the old single-guild env var
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
 
-MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-5.6").strip()
+MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-5.6-sol").strip()
 
 # ElevenLabs powers the optional /voice command. The API key must be supplied
 # as a deployment secret; the voice ID is safe to keep as a configurable default.
