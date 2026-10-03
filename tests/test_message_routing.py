@@ -147,7 +147,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reaction_only_response_adds_reaction_without_message(self) -> None:
         message = FakeMessage(29, self.human, "Good news", channel=self.channel)
-        response = main.CompanionResponse(reaction_emoji="🎉")
+        response = main.CompanionResponse(reaction_emojis=("🎉",))
         with patch.object(main, "generate_companion_reply", new=AsyncMock(return_value=response)):
             await main.handle_chat_message(message, "Good news", is_dm=False, source="human-direct")
 
@@ -155,6 +155,23 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.replies, [])
         self.assertEqual(self.channel.sent, [])
         self.assertFalse(any(item["role"] == "assistant" for item in self.saved_messages()))
+
+    async def test_multiple_reactions_and_written_reply_are_both_sent(self) -> None:
+        message = FakeMessage(33, self.human, "Excellent news", channel=self.channel)
+        response = main.CompanionResponse(
+            reply_text="That deserves the full set.",
+            reaction_emojis=("🎉", "💚", "🫎"),
+        )
+        with patch.object(main, "generate_companion_reply", new=AsyncMock(return_value=response)):
+            await main.handle_chat_message(
+                message,
+                "Excellent news",
+                is_dm=False,
+                source="human-direct",
+            )
+
+        self.assertEqual(message.added_reactions, ["🎉", "💚", "🫎"])
+        self.assertEqual(self.channel.sent[0][0], "That deserves the full set.")
 
     async def test_existing_identical_reaction_is_not_added_again(self) -> None:
         message = FakeMessage(30, self.human, "Already seen", channel=self.channel)

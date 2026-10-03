@@ -617,8 +617,8 @@ async def handle_chat_message(
         if isinstance(response, str):
             response = CompanionResponse(reply_text=response)
 
-        if response.reaction_emoji:
-            await add_optional_reaction(message, response.reaction_emoji)
+        for emoji in response.reaction_emojis:
+            await add_optional_reaction(message, emoji)
 
         if response.reply_text:
             memory.save_message(
@@ -639,7 +639,7 @@ async def handle_chat_message(
                 response.reply_text,
                 reply_to=message if reply_to_trigger else None,
             )
-        elif not response.reaction_emoji:
+        elif not response.reaction_emojis:
             _debug_log(
                 f"No reply or reaction chosen for Discord message {message.id} source={source}."
             )
