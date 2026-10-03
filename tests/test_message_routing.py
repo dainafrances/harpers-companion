@@ -173,6 +173,11 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.added_reactions, ["🎉", "💚", "🫎"])
         self.assertEqual(self.channel.sent[0][0], "That deserves the full set.")
 
+    def test_original_response_object_still_exposes_its_reaction(self) -> None:
+        original_response = SimpleNamespace(reaction_emoji="💚")
+
+        self.assertEqual(main._response_reactions(original_response), ("💚",))
+
     async def test_existing_identical_reaction_is_not_added_again(self) -> None:
         message = FakeMessage(30, self.human, "Already seen", channel=self.channel)
         message.reactions = [SimpleNamespace(emoji="💚", me=True)]

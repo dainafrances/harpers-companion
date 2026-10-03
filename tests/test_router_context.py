@@ -13,6 +13,15 @@ router = importlib.import_module("src.router")
 
 
 class RouterContextTests(unittest.IsolatedAsyncioTestCase):
+    def test_companion_response_accepts_singular_and_plural_reaction_fields(self) -> None:
+        original = router.CompanionResponse(reaction_emoji="💚")
+        current = router.CompanionResponse(reaction_emojis=("😂", "🫎"))
+
+        self.assertEqual(original.reaction_emojis, ("💚",))
+        self.assertEqual(original.reaction_emoji, "💚")
+        self.assertEqual(current.reaction_emojis, ("😂", "🫎"))
+        self.assertEqual(current.reaction_emoji, "😂")
+
     def test_observed_history_is_wrapped_and_source_metadata_is_removed(self) -> None:
         history = [
             {

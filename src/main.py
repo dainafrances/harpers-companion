@@ -303,6 +303,15 @@ async def add_optional_reaction(message: discord.Message, emoji: str) -> bool:
         reaction_attempts_in_flight.discard(key)
 
 
+def _response_reactions(response: object) -> tuple[str, ...]:
+    """Read new or original response objects safely during rolling deployments."""
+    emojis = getattr(response, "reaction_emojis", None)
+    if emojis is not None:
+        return tuple(emojis)
+    emoji = getattr(response, "reaction_emoji", None)
+    return (emoji,) if emoji else ()
+
+
 async def _latest_bot_message_text(
     channel: discord.abc.Messageable | None,
     *,
@@ -617,7 +626,8 @@ async def handle_chat_message(
         if isinstance(response, str):
             response = CompanionResponse(reply_text=response)
 
-        for emoji in response.reaction_emojis:
+        reaction_emojis = _response_reactions(response)
+        for emoji in reaction_emojis:
             await add_optional_reaction(message, emoji)
 
         if response.reply_text:
@@ -639,7 +649,7 @@ async def handle_chat_message(
                 response.reply_text,
                 reply_to=message if reply_to_trigger else None,
             )
-        elif not response.reaction_emojis:
+        elif not reaction_emojis:
             _debug_log(
                 f"No reply or reaction chosen for Discord message {message.id} source={source}."
             )

@@ -29,20 +29,34 @@ DEFAULT_MODEL = "openai/gpt-5.6"
 MAX_REACTIONS_PER_MESSAGE = 3
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class CompanionResponse:
-    """Actions the companion chose for the current Discord message."""
+    """Actions chosen for a message, compatible with the original singular field."""
 
-    reply_text: str | None = None
-    reaction_emojis: tuple[str, ...] = ()
+    reply_text: str | None
+    reaction_emojis: tuple[str, ...]
 
+    def __init__(
+        self,
+        reply_text: str | None = None,
+        reaction_emojis: tuple[str, ...] = (),
+        *,
+        reaction_emoji: str | None = None,
+    ) -> None:
+        combined = list(reaction_emojis)
+        if reaction_emoji and reaction_emoji not in combined:
+            combined.insert(0, reaction_emoji)
+        object.__setattr__(self, "reply_text", reply_text)
+        object.__setattr__(
+            self,
+            "reaction_emojis",
+            tuple(combined[:MAX_REACTIONS_PER_MESSAGE]),
+        )
 
-@dataclass(frozen=True)
-class CompanionResponse:
-    """Actions the companion chose for the current Discord message."""
-
-    reply_text: str | None = None
-    reaction_emoji: str | None = None
+    @property
+    def reaction_emoji(self) -> str | None:
+        """Original single-reaction view for callers on the first implementation."""
+        return self.reaction_emojis[0] if self.reaction_emojis else None
 
 
 def _reply_token_limit() -> int:
