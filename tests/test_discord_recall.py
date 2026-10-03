@@ -188,7 +188,7 @@ class RouterRecallContextTests(unittest.IsolatedAsyncioTestCase):
                 discord_retrieval_context="[DISCORD_RETRIEVAL]\nstatus: COMPLETE\n[/DISCORD_RETRIEVAL]",
             )
 
-        self.assertEqual(reply, "Reply")
+        self.assertEqual(reply, router.CompanionResponse(reply_text="Reply"))
         sent_messages = create.await_args.kwargs["messages"]
         contents = [message["content"] for message in sent_messages if message["role"] == "system"]
         self.assertTrue(any("DISCORD RETRIEVAL EVIDENCE POLICY" in item for item in contents))
