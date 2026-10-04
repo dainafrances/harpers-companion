@@ -6,7 +6,8 @@ import os
 import random
 import re
 import time
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
@@ -14,6 +15,7 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from . import discord_recall
+from . import continuity
 from . import document_reader
 from . import elevenlabs_voice
 from . import memory
@@ -64,6 +66,27 @@ DISCORD_RECALL_CHANNEL_IDS_RAW = os.getenv("DISCORD_RECALL_CHANNEL_IDS", "").str
 # Channel labels override guild labels.
 ROOM_CONTEXT_GUILD_LABELS_RAW = os.getenv("ROOM_CONTEXT_GUILD_LABELS", "").strip()
 ROOM_CONTEXT_CHANNEL_LABELS_RAW = os.getenv("ROOM_CONTEXT_CHANNEL_LABELS", "").strip()
+
+# Colin-only cross-server continuity. Configuration is fail-closed inside the
+# continuity module: both guild zones and exact guild/channel routes are required.
+continuity_config = continuity.config_from_env()
+try:
+    _continuity_handoff_limit_raw = int(
+        os.getenv("DISCORD_CONTINUITY_HANDOFF_LIMIT", "12").strip()
+    )
+except ValueError:
+    _continuity_handoff_limit_raw = 12
+CONTINUITY_HANDOFF_LIMIT = min(50, max(1, _continuity_handoff_limit_raw))
+try:
+    _continuity_handoff_max_age_raw = int(
+        os.getenv("DISCORD_CONTINUITY_HANDOFF_MAX_AGE_MINUTES", "120").strip()
+    )
+except ValueError:
+    _continuity_handoff_max_age_raw = 120
+CONTINUITY_HANDOFF_MAX_AGE_MINUTES = min(
+    24 * 60,
+    max(1, _continuity_handoff_max_age_raw),
+)
 
 # Comma-separated list of other companion bot names (display/global/name).
 COMPANION_BOT_NAMES_RAW = os.getenv(
@@ -438,6 +461,317 @@ def _attachment_marker(message: discord.Message) -> str:
     return f"\n[ATTACHMENTS: {total} attachment(s)]" if total else ""
 
 
+@dataclass(frozen=True)
+class ContinuityPromptInputs:
+    writer_context: str | None = None
+    auditor_context: str | None = None
+    allowed_contents: tuple[str, ...] = ()
+    forbidden_contents: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RecallPromptInputs:
+    writer_context: str | None = None
+    event_rows: tuple[dict[str, object], ...] = ()
+
+
+def _message_event_timestamp(message: discord.Message) -> str:
+    value = getattr(message, "created_at", None)
+    if not isinstance(value, datetime):
+        value = datetime.now(timezone.utc)
+    elif value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.isoformat()
+
+
+def _parsed_event_timestamp(row: dict[str, object]) -> datetime | None:
+    raw = row.get("event_timestamp")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _continuity_zone_for_message(
+    message: discord.Message,
+    *,
+    is_dm: bool,
+) -> continuity.ContinuityZone | None:
+    if is_dm or message.guild is None:
+        return None
+    return continuity_config.zone_for(
+        guild_id=message.guild.id,
+        channel_id=message.channel.id,
+    )
+
+
+def _record_inbound_continuity_event(
+    message: discord.Message,
+    *,
+    is_dm: bool,
+    source: str,
+) -> bool:
+    zone = _continuity_zone_for_message(message, is_dm=is_dm)
+    if zone is None:
+        return False
+
+    guild = message.guild
+    author = message.author
+    return memory.save_continuity_event(
+        event_id=str(message.id),
+        guild_id=str(guild.id),
+        guild_name=getattr(guild, "name", None) or str(guild.id),
+        channel_id=str(message.channel.id),
+        channel_name=getattr(message.channel, "name", None) or str(message.channel.id),
+        continuity_zone=zone.value,
+        speaker_user_id=str(author.id),
+        speaker_name=(
+            getattr(author, "display_name", None)
+            or getattr(author, "name", None)
+            or str(author.id)
+        ),
+        speaker_is_bot=bool(getattr(author, "bot", False)),
+        role="user",
+        content=(message.content or "") + _attachment_marker(message),
+        event_timestamp=_message_event_timestamp(message),
+        source=source,
+    )
+
+
+def _record_outbound_continuity_event(
+    trigger_message: discord.Message,
+    *,
+    content: str,
+) -> bool:
+    zone = _continuity_zone_for_message(trigger_message, is_dm=False)
+    if zone is None or bot.user is None or trigger_message.guild is None:
+        return False
+
+    return memory.save_continuity_event(
+        event_id=f"colin-reply:{trigger_message.id}",
+        guild_id=str(trigger_message.guild.id),
+        guild_name=(
+            getattr(trigger_message.guild, "name", None)
+            or str(trigger_message.guild.id)
+        ),
+        channel_id=str(trigger_message.channel.id),
+        channel_name=(
+            getattr(trigger_message.channel, "name", None)
+            or str(trigger_message.channel.id)
+        ),
+        continuity_zone=zone.value,
+        speaker_user_id=str(bot.user.id),
+        speaker_name=(
+            getattr(bot.user, "display_name", None)
+            or getattr(bot.user, "name", None)
+            or str(bot.user.id)
+        ),
+        speaker_is_bot=True,
+        role="assistant",
+        content=content,
+        event_timestamp=datetime.now(timezone.utc).isoformat(),
+        source="generated-colin",
+    )
+
+
+def _latest_relevant_continuity_event(
+    *,
+    before_timestamp: str,
+    current_speaker_id: int,
+    current_guild_id: int,
+    current_channel_id: int,
+) -> dict[str, object] | None:
+    speaker_ids: list[int] = [current_speaker_id]
+    if owner_id is not None:
+        if owner_id not in speaker_ids:
+            speaker_ids.append(owner_id)
+    if bot.user is not None and bot.user.id not in speaker_ids:
+        speaker_ids.append(bot.user.id)
+
+    candidates: list[tuple[datetime, str, dict[str, object]]] = []
+    for speaker_id in speaker_ids:
+        row = memory.get_latest_continuity_event_by_speaker_before(
+            speaker_user_id=str(speaker_id),
+            before_timestamp=before_timestamp,
+            exclude_guild_id=str(current_guild_id),
+            exclude_channel_id=str(current_channel_id),
+        )
+        if row is None:
+            continue
+        row_dict: dict[str, object] = dict(row)
+        timestamp = _parsed_event_timestamp(row_dict)
+        if timestamp is None:
+            continue
+        if continuity_config.zone_for(
+            guild_id=row_dict.get("guild_id"),
+            channel_id=row_dict.get("channel_id"),
+        ) is None:
+            continue
+        candidates.append((timestamp, str(row_dict.get("event_id", "")), row_dict))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
+def _build_continuity_prompt_inputs(
+    message: discord.Message,
+    *,
+    is_dm: bool,
+    additional_event_rows: tuple[dict[str, object], ...] = (),
+) -> ContinuityPromptInputs:
+    current_zone = _continuity_zone_for_message(message, is_dm=is_dm)
+    if current_zone is None or message.guild is None:
+        return ContinuityPromptInputs()
+
+    current_timestamp = _message_event_timestamp(message)
+    event_rows: list[dict[str, object]] = []
+    anchor = _latest_relevant_continuity_event(
+        before_timestamp=current_timestamp,
+        current_speaker_id=message.author.id,
+        current_guild_id=message.guild.id,
+        current_channel_id=message.channel.id,
+    )
+    if anchor is not None:
+        anchor_location = (
+            str(anchor.get("guild_id", "")),
+            str(anchor.get("channel_id", "")),
+        )
+        anchor_timestamp = _parsed_event_timestamp(anchor)
+        current_datetime = datetime.fromisoformat(
+            current_timestamp.replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+        anchor_age = (
+            current_datetime - anchor_timestamp
+            if anchor_timestamp is not None
+            else None
+        )
+        if (
+            anchor_age is not None
+            and timedelta(0) <= anchor_age
+            <= timedelta(minutes=CONTINUITY_HANDOFF_MAX_AGE_MINUTES)
+        ):
+            event_rows.extend(
+                memory.get_recent_continuity_events_from_channel_before(
+                    guild_id=anchor_location[0],
+                    channel_id=anchor_location[1],
+                    before_timestamp=current_timestamp,
+                    limit=CONTINUITY_HANDOFF_LIMIT,
+                )
+            )
+
+    # Prefer the richer continuity-ledger row if the same Discord event also
+    # arrived through the legacy recall index. Discord IDs are globally unique.
+    seen_event_ids: set[str] = set()
+    merged_rows: list[dict[str, object]] = []
+    for row in [*event_rows, *additional_event_rows]:
+        raw_event_id = row.get("event_id", row.get("message_id"))
+        event_id = str(raw_event_id or "")
+        if not event_id or event_id in seen_event_ids:
+            continue
+        seen_event_ids.add(event_id)
+        merged_rows.append(row)
+    if not merged_rows:
+        return ContinuityPromptInputs()
+
+    prompt_context = continuity.build_prompt_context(
+        merged_rows,
+        current_guild_id=message.guild.id,
+        current_channel_id=message.channel.id,
+        config=continuity_config,
+    )
+    if prompt_context is None or not prompt_context.events:
+        return ContinuityPromptInputs()
+
+    allowed_contents = tuple(
+        item.event.content
+        for item in prompt_context.events
+        if item.disclosure is continuity.DisclosureMarker.ALLOWED
+    )
+    forbidden_contents = tuple(
+        item.event.content
+        for item in prompt_context.events
+        if item.disclosure is continuity.DisclosureMarker.FORBIDDEN
+    )
+    return ContinuityPromptInputs(
+        writer_context=(
+            continuity.format_writer_context(prompt_context)
+            if allowed_contents
+            else None
+        ),
+        auditor_context=(
+            continuity.format_auditor_context(prompt_context)
+            if forbidden_contents
+            else None
+        ),
+        allowed_contents=allowed_contents,
+        forbidden_contents=forbidden_contents,
+    )
+
+
+def _latest_journal_for_prompt(
+    message: discord.Message,
+    *,
+    is_dm: bool,
+) -> str | None:
+    latest_journal = memory.get_latest_journal_entry()
+    if not continuity_config.configured:
+        return latest_journal
+    if is_dm or not continuity_config.enabled:
+        return None
+    zone = _continuity_zone_for_message(message, is_dm=False)
+    return latest_journal if zone is continuity.ContinuityZone.HARPERS else None
+
+
+def _discord_retrieval_for_prompt(
+    message: discord.Message,
+    *,
+    cleaned_content: str,
+    is_dm: bool,
+) -> RecallPromptInputs:
+    if is_dm or not discord_recall.should_attempt_recall(cleaned_content):
+        return RecallPromptInputs()
+
+    guild_id = message.guild.id if message.guild else None
+    channel_id = message.channel.id
+    if not continuity_config.configured:
+        return RecallPromptInputs(
+            writer_context=discord_recall.build_retrieval_context_for_prompt(
+                cleaned_content,
+                guild_id=guild_id,
+                channel_id=channel_id,
+                permissions=recall_permissions,
+            )
+        )
+    if not continuity_config.enabled:
+        return RecallPromptInputs()
+
+    result = discord_recall.retrieve_for_query_with_disclosure(
+        cleaned_content,
+        guild_id=guild_id,
+        channel_id=channel_id,
+        permissions=recall_permissions,
+        continuity_config=continuity_config,
+    )
+    return RecallPromptInputs(
+        writer_context=discord_recall.format_disclosure_aware_writer_context(
+            query=cleaned_content,
+            result=result,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            include_messages=False,
+        ),
+        event_rows=tuple([*result.writer_messages, *result.auditor_messages]),
+    )
+
+
 def save_observed_message(message: discord.Message, *, source: str) -> bool:
     """Save visible room context without causing Colin to answer."""
     discord_recall.index_message(message, permissions=recall_permissions, source=source)
@@ -450,6 +784,12 @@ def save_observed_message(message: discord.Message, *, source: str) -> bool:
     ):
         _debug_log(f"Skipping duplicate observed Discord message {message.id}.")
         return False
+
+    _record_inbound_continuity_event(
+        message,
+        is_dm=False,
+        source=source,
+    )
 
     content = (message.content or "").strip() or "[No text content]"
     stored_payload = _speaker_header(message, is_dm=False) + content + _attachment_marker(message)
@@ -483,6 +823,7 @@ def _speaker_header(message: discord.Message, *, is_dm: bool) -> str:
 
     return (
         f"[SPEAKER] name={speaker_name} id={speaker_id} is_bot={is_bot}\n"
+        f"[CURRENT_DISCORD_EVENT_TIME] {_message_event_timestamp(message)}\n"
         f"{room_block}\n"
         f"[OWNER] owner_id={owner_id}\n"
         "RULES:\n"
@@ -529,6 +870,22 @@ async def handle_chat_message(
                 channel_id=message.channel.id,
                 message_id=message.id,
             )
+
+        recall_inputs = _discord_retrieval_for_prompt(
+            message,
+            cleaned_content=cleaned_content,
+            is_dm=is_dm,
+        )
+        continuity_inputs = _build_continuity_prompt_inputs(
+            message,
+            is_dm=is_dm,
+            additional_event_rows=recall_inputs.event_rows,
+        )
+        _record_inbound_continuity_event(
+            message,
+            is_dm=is_dm,
+            source=source,
+        )
 
         header = _speaker_header(message, is_dm=is_dm)
         payload = header + cleaned_content
@@ -578,16 +935,13 @@ async def handle_chat_message(
             payload += "\n\n" + "\n\n".join(document_blocks)
 
         # Pull history BEFORE saving current message, so we don't double-send the same turn
-        history = memory.get_recent_messages(channel_id=message.channel.id, limit=12)
-        latest_journal = memory.get_latest_journal_entry()
-        discord_retrieval_context = None
-        if not is_dm:
-            discord_retrieval_context = discord_recall.build_retrieval_context_for_prompt(
-                cleaned_content,
-                guild_id=message.guild.id if message.guild else None,
-                channel_id=message.channel.id,
-                permissions=recall_permissions,
-            )
+        history = memory.get_recent_messages(
+            channel_id=message.channel.id,
+            limit=12,
+            include_created_at=True,
+        )
+        latest_journal = _latest_journal_for_prompt(message, is_dm=is_dm)
+        discord_retrieval_context = recall_inputs.writer_context
 
         # Save current user message for future turns / memory
         stored_payload = payload
@@ -619,6 +973,10 @@ async def handle_chat_message(
                 speaker_is_owner=owner_id is not None and message.author.id == owner_id,
                 image_urls=image_urls,
                 discord_retrieval_context=discord_retrieval_context,
+                continuity_writer_context=continuity_inputs.writer_context,
+                continuity_auditor_context=continuity_inputs.auditor_context,
+                continuity_allowed_contents=continuity_inputs.allowed_contents,
+                continuity_forbidden_contents=continuity_inputs.forbidden_contents,
             )
 
         # String compatibility keeps older tests/extensions safe while callers
@@ -631,14 +989,6 @@ async def handle_chat_message(
             await add_optional_reaction(message, emoji)
 
         if response.reply_text:
-            memory.save_message(
-                channel_id=message.channel.id,
-                user_id=bot.user.id if bot.user else 0,
-                role="assistant",
-                content=response.reply_text,
-                source=source,
-            )
-
             chunk_count = len(split_for_discord(response.reply_text))
             _debug_log(
                 f"Sending reply for Discord message {message.id} "
@@ -649,6 +999,18 @@ async def handle_chat_message(
                 response.reply_text,
                 reply_to=message if reply_to_trigger else None,
             )
+            memory.save_message(
+                channel_id=message.channel.id,
+                user_id=bot.user.id if bot.user else 0,
+                role="assistant",
+                content=response.reply_text,
+                source=source,
+            )
+            if not is_dm:
+                _record_outbound_continuity_event(
+                    message,
+                    content=response.reply_text,
+                )
         elif not reaction_emojis:
             _debug_log(
                 f"No reply or reaction chosen for Discord message {message.id} source={source}."
@@ -710,6 +1072,22 @@ async def on_ready() -> None:
     _debug_log(
         f"Room context channel labels: "
         f"{sorted(room_context_config.channel_labels) if room_context_config.channel_labels else 'NONE'}"
+    )
+    continuity_guild_ids = sorted(continuity_config.guild_zones)
+    continuity_routes = sorted(continuity_config.approved_channel_routes)
+    continuity_state = (
+        "enabled"
+        if continuity_config.enabled
+        else "invalid"
+        if continuity_config.configured
+        else "unconfigured"
+    )
+    _debug_log(
+        f"Discord continuity: {continuity_state}; "
+        f"guild_ids={continuity_guild_ids}; routes={continuity_routes}; "
+        f"route_count={len(continuity_routes)}; config_error_count={len(continuity_config.errors)}; "
+        f"handoff_limit={CONTINUITY_HANDOFF_LIMIT}; "
+        f"handoff_max_age_minutes={CONTINUITY_HANDOFF_MAX_AGE_MINUTES}."
     )
     _debug_log(f"Owner ID: {owner_id}")
     _debug_log(f"Companion bot names: {sorted(companion_bot_names)}")
@@ -902,11 +1280,21 @@ async def status(interaction: discord.Interaction) -> None:
     owner_text = "set" if owner_id else "not set"
     count = memory.count_messages()
     recall_text = "enabled" if recall_permissions.enabled else "disabled"
+    continuity_text = (
+        "enabled"
+        if continuity_config.enabled
+        else "invalid"
+        if continuity_config.configured
+        else "unconfigured"
+    )
     await interaction.response.send_message(
         f"Model: `{MODEL_PRIMARY}`\n"
         f"Owner lock (DMs): {owner_text}\n"
         f"Saved messages: {count}\n"
-        f"Discord recall: {recall_text}",
+        f"Discord recall: {recall_text}\n"
+        f"Discord continuity: {continuity_text} "
+        f"({len(continuity_config.guild_zones)} guild IDs, "
+        f"{len(continuity_config.approved_channel_routes)} channel routes)",
         ephemeral=True,
     )
 
