@@ -153,6 +153,7 @@ class ContinuityMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         speaker: FakeAuthor,
         timestamp: str,
         role: str | None = None,
+        source: str | None = None,
     ) -> None:
         memory.save_continuity_event(
             event_id=event_id,
@@ -167,7 +168,7 @@ class ContinuityMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             role=role or ("assistant" if speaker.bot else "user"),
             content=content,
             event_timestamp=timestamp,
-            source="generated-colin" if speaker.bot else "observed-human",
+            source=source or ("generated-colin" if speaker.bot else "observed-human"),
         )
 
     def test_transition_uses_actual_newest_owner_or_colin_event(self) -> None:
@@ -468,6 +469,58 @@ class ContinuityMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(secret, inputs.auditor_context)
         self.assertEqual(inputs.allowed_contents, ())
         self.assertEqual(inputs.forbidden_contents, (secret,))
+        self.assertEqual(inputs.owner_releasable_contents, (secret,))
+
+    def test_owner_release_eligibility_excludes_other_people_private_words(self) -> None:
+        ben = FakeAuthor(88, "Ben", bot=True)
+        owner_secret = "Daina's private detail"
+        colin_secret = "Colin's private reply"
+        ben_secret = "Ben's private statement"
+        shared = {
+            "guild_id": 300,
+            "guild_name": "The Harpers",
+            "channel_id": 301,
+            "channel_name": "the-hearth",
+            "zone": "harpers",
+        }
+        self.seed_event(
+            "owner-private",
+            owner_secret,
+            speaker=self.owner,
+            timestamp="2026-10-03T11:00:00+00:00",
+            **shared,
+        )
+        self.seed_event(
+            "colin-private",
+            colin_secret,
+            speaker=self.colin,
+            timestamp="2026-10-03T11:01:00+00:00",
+            **shared,
+        )
+        self.seed_event(
+            "ben-private",
+            ben_secret,
+            speaker=ben,
+            source="observed-companion-bot",
+            timestamp="2026-10-03T11:02:00+00:00",
+            **shared,
+        )
+        current = self.message(
+            516,
+            "You have my permission to share our Harpers exchange here.",
+            timestamp="2026-10-03T12:00:00+00:00",
+        )
+
+        inputs = main._build_continuity_prompt_inputs(current, is_dm=False)
+
+        self.assertEqual(
+            inputs.owner_releasable_contents,
+            (owner_secret, colin_secret),
+        )
+        self.assertEqual(
+            inputs.forbidden_contents,
+            (owner_secret, colin_secret, ben_secret),
+        )
 
     def test_private_handoff_remains_sealed_after_a_public_arrival_greeting(self) -> None:
         secret = "The Harpers-only confidence survives as audit evidence."

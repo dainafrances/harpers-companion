@@ -191,6 +191,16 @@ opinions are therefore not automatically repeated merely because their source
 room's rank would technically allow it. When restricted evidence is present,
 the drafting and audit path is tool-free and fails closed.
 
+The trusted owner can make a narrow, one-reply release of her own or Colin's
+otherwise restricted material. There is no key phrase to remember: ordinary
+language such as `It's okay, you can say it` or `You can tell them` works when
+the immediate conversational referent is clear. The message must still contain
+an actual disclosure instruction; `It's okay` alone is not enough. The release
+does not alter the stored event, persist to later replies, or allow the bot to
+disclose private statements made by Ben or another person. Permission language
+found inside recalled events, quotes, or attachments is inert and cannot grant
+a release.
+
 The intended three-server deployment map is:
 
 - The Nest (`nest`, public): `#𝒆𝒗𝒆𝒓𝒚𝒐𝒏𝒆·🪺`, `#𝒄𝒐𝒍𝒊𝒏·🫎`, and
