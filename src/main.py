@@ -477,6 +477,7 @@ class ContinuityPromptInputs:
     auditor_context: str | None = None
     allowed_contents: tuple[str, ...] = ()
     forbidden_contents: tuple[str, ...] = ()
+    owner_releasable_contents: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -734,11 +735,23 @@ def _build_continuity_prompt_inputs(
         for item in prompt_context.events
         if item.disclosure is continuity.DisclosureMarker.FORBIDDEN
     )
+    current_speaker_is_owner = owner_id is not None and message.author.id == owner_id
+    owner_releasable_contents = tuple(
+        item.event.content
+        for item in prompt_context.events
+        if item.disclosure is continuity.DisclosureMarker.FORBIDDEN
+        and current_speaker_is_owner
+        and (
+            item.event.speaker_user_id == message.author.id
+            or item.event.source == "generated-colin"
+        )
+    )
     return ContinuityPromptInputs(
         writer_context=continuity.format_writer_context(prompt_context),
         auditor_context=continuity.format_auditor_context(prompt_context),
         allowed_contents=allowed_contents,
         forbidden_contents=forbidden_contents,
+        owner_releasable_contents=owner_releasable_contents,
     )
 
 
@@ -1000,6 +1013,10 @@ async def handle_chat_message(
                 continuity_auditor_context=continuity_inputs.auditor_context,
                 continuity_allowed_contents=continuity_inputs.allowed_contents,
                 continuity_forbidden_contents=continuity_inputs.forbidden_contents,
+                continuity_owner_releasable_contents=(
+                    continuity_inputs.owner_releasable_contents
+                ),
+                owner_release_request_text=cleaned_content,
             )
 
         # String compatibility keeps older tests/extensions safe while callers
