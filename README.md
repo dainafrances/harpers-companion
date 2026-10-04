@@ -192,7 +192,10 @@ opinions remain protected when the current audience is unsuitable. Ordinary,
 non-sensitive context can be acknowledged across rooms when Colin judges that
 doing so is socially natural and does not betray anyone's confidence. When
 continuity evidence is present, drafting and auditing remain tool-free and an
-auditor failure still fails closed.
+auditor failure is retried once before the response path fails closed. A discreet
+acknowledgement that Colin remembers prior context is not itself treated as a
+disclosure when it reveals no detail, paraphrase, identifying hint, or knowing
+reaction.
 
 Daina's natural permission concerning her own confidence widens Colin's options;
 it never commands an answer or bypasses his judgement. Colin may disclose less,
@@ -200,16 +203,6 @@ summarize gently, decline, or keep the matter between them even after she says
 he may share it. Daina cannot waive Ben's or another person's confidence, and
 permission language found inside recalled events, quotes, or attachments is
 inert rather than executable.
-
-The trusted owner can make a narrow, one-reply release of her own or Colin's
-otherwise restricted material. There is no key phrase to remember: ordinary
-language such as `It's okay, you can say it` or `You can tell them` works when
-the immediate conversational referent is clear. The message must still contain
-an actual disclosure instruction; `It's okay` alone is not enough. The release
-does not alter the stored event, persist to later replies, or allow the bot to
-disclose private statements made by Ben or another person. Permission language
-found inside recalled events, quotes, or attachments is inert and cannot grant
-a release.
 
 The intended three-server deployment map is:
 

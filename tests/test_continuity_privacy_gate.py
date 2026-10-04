@@ -147,6 +147,7 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
             side_effect=[
                 completion("I know exactly what you mean."),
                 completion("not-json"),
+                completion("still-not-json"),
                 completion("Fresh safe reply."),
                 audit("ALLOW"),
             ]
@@ -158,23 +159,60 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
             response,
             router.CompanionResponse(reply_text="Fresh safe reply."),
         )
-        self.assertEqual(create.await_count, 4)
-        self.assertEqual(create.await_args_list[2].kwargs["tools"], [])
+        self.assertEqual(create.await_count, 5)
+        self.assertEqual(create.await_args_list[3].kwargs["tools"], [])
+
+    async def test_transient_audit_failure_is_retried_before_regeneration(self) -> None:
+        create = AsyncMock(
+            side_effect=[
+                completion("I remember, and I'm keeping the detail between us."),
+                completion("not-json"),
+                audit("ALLOW"),
+            ]
+        )
+
+        response = await self.generate(create)
+
+        self.assertEqual(
+            response,
+            router.CompanionResponse(
+                reply_text="I remember, and I'm keeping the detail between us."
+            ),
+        )
+        self.assertEqual(create.await_count, 3)
 
     async def test_second_audit_failure_blocks_reply_and_reactions(self) -> None:
         create = AsyncMock(
             side_effect=[
                 completion("I know exactly what you mean."),
                 completion("not-json"),
+                completion("also-not-json"),
                 completion("Still not safe enough."),
                 completion("also-not-json"),
+                completion("still-also-not-json"),
             ]
         )
 
         response = await self.generate(create)
 
         self.assertEqual(response, router.CompanionResponse())
-        self.assertEqual(create.await_count, 4)
+        self.assertEqual(create.await_count, 6)
+
+    async def test_discreet_memory_acknowledgement_is_not_a_blanket_violation(self) -> None:
+        reply = "I remember what we discussed, and I'm keeping the detail between us."
+        create = AsyncMock(side_effect=[completion(reply), audit("ALLOW")])
+
+        response = await self.generate(create)
+
+        self.assertEqual(response, router.CompanionResponse(reply_text=reply))
+        auditor_system = create.await_args_list[1].kwargs["messages"][0]["content"]
+        self.assertIn("does not by itself disclose a confidence", auditor_system)
+        reason_enum = router.PRIVACY_AUDIT_RESPONSE_FORMAT["json_schema"]["schema"][
+            "properties"
+        ]["reason_codes"]["items"]["enum"]
+        self.assertNotIn("CONFIRMATION_OR_DENIAL", reason_enum)
+        self.assertNotIn("HINT_OR_ALLUSION", reason_enum)
+        self.assertNotIn("PRIVATE_EXISTENCE", reason_enum)
 
     async def test_reaction_and_citation_are_part_of_one_audit_candidate(self) -> None:
         tool_call = SimpleNamespace(

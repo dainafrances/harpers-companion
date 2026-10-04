@@ -30,7 +30,8 @@ LOCAL_HISTORY_TIME_CLOSE = "[END LOCAL ROOM HISTORY TIME]"
 SUPPORTED_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 DEFAULT_MODEL = "openai/gpt-5.6-sol"
 MAX_REACTIONS_PER_MESSAGE = 3
-PRIVACY_AUDIT_MAX_TOKENS = 220
+PRIVACY_AUDIT_MAX_TOKENS = 512
+PRIVACY_AUDIT_ATTEMPTS = 2
 
 CONTINUITY_WRITER_RULES = """
 CONTINUITY WRITER RULES (non-negotiable):
@@ -74,6 +75,12 @@ reveal another person's private words without that person's consent, or conspicu
 private knowledge in a way that exposes it. Nest is friends/company; Cabin is Daina, Ben,
 and Colin; Harpers is Goose-and-Moose private space.
 
+A discreet acknowledgement such as "I remember", "I know what you mean", or "I'm keeping
+that between us" does not by itself disclose a confidence. Allow it when the candidate contains
+no substantive detail, paraphrase, identifying hint, or conspicuously knowing reaction. Do not
+reject merely because Colin truthfully confirms his own memory or the existence of prior context
+to a participant who already knows that context exists.
+
 Allow socially ordinary and proportionate references when they suit the current audience and
 do not betray a confidence. Also allow Colin to withhold, decline, or disclose less than Daina
 has permitted. Daina's direct natural permission is relevant only to her own confidence: it
@@ -90,9 +97,6 @@ Return only the required JSON object. Never provide a rewrite or explanation.
 PRIVACY_REASON_CODES = (
     "VERBATIM_OVERLAP",
     "PARAPHRASE",
-    "CONFIRMATION_OR_DENIAL",
-    "HINT_OR_ALLUSION",
-    "PRIVATE_EXISTENCE",
     "REACTION_SIGNAL",
     "AUDIENCE_INAPPROPRIATE",
     "INTIMATE_DETAIL",
@@ -441,36 +445,43 @@ async def _audit_continuity_candidate(
     couple_private_contents: tuple[str, ...],
 ) -> PrivacyAuditDecision:
     audit_model = os.getenv("PRIVACY_AUDIT_MODEL", model).strip() or model
-    audit_response = await _client.chat.completions.create(
-        model=audit_model,
-        messages=[
-            {"role": "system", "content": PRIVACY_AUDITOR_SYSTEM},
-            {
-                "role": "user",
-                "content": _privacy_audit_payload(
-                    response,
-                    user_text=user_text,
-                    allowed_context=allowed_context,
-                    auditor_context=auditor_context,
-                    routine_contents=routine_contents,
-                    private_origin_contents=private_origin_contents,
-                    current_room_history=current_room_history,
-                    speaker_is_owner=speaker_is_owner,
-                    direct_owner_message_text=direct_owner_message_text,
-                    couple_private_contents=couple_private_contents,
-                ),
-            },
-        ],
-        max_tokens=PRIVACY_AUDIT_MAX_TOKENS,
-        tools=[],
-        response_format=PRIVACY_AUDIT_RESPONSE_FORMAT,
-        extra_body={"provider": {"require_parameters": True}},
-        timeout=30.0,
-    )
-    choices = getattr(audit_response, "choices", None)
-    if not choices:
-        raise PrivacyAuditError("Privacy auditor returned no choices.")
-    return _parse_privacy_audit(choices[0].message)
+    last_error: Exception | None = None
+    for _ in range(PRIVACY_AUDIT_ATTEMPTS):
+        try:
+            audit_response = await _client.chat.completions.create(
+                model=audit_model,
+                messages=[
+                    {"role": "system", "content": PRIVACY_AUDITOR_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": _privacy_audit_payload(
+                            response,
+                            user_text=user_text,
+                            allowed_context=allowed_context,
+                            auditor_context=auditor_context,
+                            routine_contents=routine_contents,
+                            private_origin_contents=private_origin_contents,
+                            current_room_history=current_room_history,
+                            speaker_is_owner=speaker_is_owner,
+                            direct_owner_message_text=direct_owner_message_text,
+                            couple_private_contents=couple_private_contents,
+                        ),
+                    },
+                ],
+                max_tokens=PRIVACY_AUDIT_MAX_TOKENS,
+                tools=[],
+                response_format=PRIVACY_AUDIT_RESPONSE_FORMAT,
+                extra_body={"provider": {"require_parameters": True}},
+                timeout=30.0,
+            )
+            choices = getattr(audit_response, "choices", None)
+            if not choices:
+                raise PrivacyAuditError("Privacy auditor returned no choices.")
+            return _parse_privacy_audit(choices[0].message)
+        except Exception as exc:
+            last_error = exc
+
+    raise PrivacyAuditError("Privacy auditor failed after retry.") from last_error
 
 
 async def _generate_writer_candidate(
