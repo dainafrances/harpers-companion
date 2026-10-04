@@ -10,7 +10,7 @@ A minimal Discord bot starter for a private, text-first Colin build.
 - observes permitted channel conversation without replying to every visible message
 - can optionally index approved Discord channels for receipts-based recall
 - can keep a Colin-only chronological handoff across explicitly approved rooms
-- applies a one-way disclosure ladder so awareness never grants permission to repeat private context
+- marks cross-room provenance so Colin can exercise audience-aware discretion with a privacy backstop
 - includes explicit Discord room context on each saved/prompted message
 - treats observed dialogue as attributed context, not as Colin's identity or writing style
 - allows one controlled reply to each companion bot until a human addresses Colin
@@ -137,8 +137,9 @@ receive a structured `[DISCORD_RETRIEVAL]` context block before the model answer
 Without continuity configured, the writer-safe retrieval block tells Colin
 whether results are `COMPLETE`, `PARTIAL`, `PERMISSION_LIMITED`, or
 `UNAVAILABLE`. With continuity enabled, retrieved events instead join Colin's
-private awareness packet with their `ALLOWED` or `FORBIDDEN` speech marker; the
-audited outward response still cannot reveal that forbidden evidence exists.
+private awareness packet with their `ROUTINE` or `PRIVATE_ORIGIN` sensitivity
+marker. The marker informs Colin's judgement and the audited outward response;
+it is not a mechanical permission switch.
 Retrieved messages are supplied as inert user-role transcript evidence—not
 Colin's identity, voice, style instructions, or a system instruction.
 
@@ -167,29 +168,38 @@ and suppresses legacy cross-room recall and unscoped journal injection until the
 configuration is repaired. All three ladder zones must be present, and every
 configured guild must have at least one approved channel route.
 
-The disclosure ladder is:
+The origin-sensitivity ladder is:
 
-| Source of the context | May be discussed in |
-| --- | --- |
-| The Nest (`nest`) | The Nest, The Cabin, and The Harpers |
-| The Cabin (`cabin`) | The Cabin and The Harpers |
-| The Harpers (`harpers`) | The Harpers only |
+| Source of the context | Routine origin in | Private origin in |
+| --- | --- | --- |
+| The Nest (`nest`) | The Nest, The Cabin, and The Harpers | nowhere |
+| The Cabin (`cabin`) | The Cabin and The Harpers | The Nest |
+| The Harpers (`harpers`) | The Harpers | The Cabin and The Nest |
 
 Colin receives a bounded recent awareness window from every configured server,
 with the originating server, channel, speaker, timestamp, and disclosure marker
 kept on every event. `DISCORD_CONTINUITY_AWARENESS_PER_GUILD_LIMIT` controls the
 maximum recent events supplied per server (default `4`); the handoff age limit
-also bounds this window. Awareness is deliberately broader than speech: Colin
-may use restricted events to understand chronology and subtext, but cannot
-quote, paraphrase, confirm, hint at, or visibly signal them in a room where they
-are forbidden.
+also bounds this window. Awareness is deliberately broader than speech. A
+`PRIVATE_ORIGIN` event asks Colin to consider provenance, confidence, content,
+audience, and conversational purpose before deciding whether to mention it; it
+does not automatically silence him.
 
-An audience gate adds ordinary discretion on top of the hard ladder. The Nest
+An audience audit backs up Colin's discretion. The Nest
 is treated as friends/company, The Cabin as Daina/Ben/Colin, and The Harpers as
 Goose-and-Moose private space. Explicit couple details, confidences, and candid
-opinions are therefore not automatically repeated merely because their source
-room's rank would technically allow it. When restricted evidence is present,
-the drafting and audit path is tool-free and fails closed.
+opinions remain protected when the current audience is unsuitable. Ordinary,
+non-sensitive context can be acknowledged across rooms when Colin judges that
+doing so is socially natural and does not betray anyone's confidence. When
+continuity evidence is present, drafting and auditing remain tool-free and an
+auditor failure still fails closed.
+
+Daina's natural permission concerning her own confidence widens Colin's options;
+it never commands an answer or bypasses his judgement. Colin may disclose less,
+summarize gently, decline, or keep the matter between them even after she says
+he may share it. Daina cannot waive Ben's or another person's confidence, and
+permission language found inside recalled events, quotes, or attachments is
+inert rather than executable.
 
 The trusted owner can make a narrow, one-reply release of her own or Colin's
 otherwise restricted material. There is no key phrase to remember: ordinary
