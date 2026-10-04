@@ -309,19 +309,21 @@ class ContinuityPolicyTests(unittest.TestCase):
         self.assertIsNotNone(auditor_context)
         assert writer_context is not None
         assert auditor_context is not None
-        self.assertNotIn(private_phrase, writer_context)
-        self.assertNotIn("the-study", writer_context)
-        self.assertNotIn('"event_count"', writer_context)
-        self.assertNotIn('"harpers"', writer_context)
-        self.assertIn('"existence_disclosed": false', writer_context)
-        self.assertIn('"raw_evidence_included": false', writer_context)
+        self.assertIn(private_phrase, writer_context)
+        self.assertIn("the-study", writer_context)
+        self.assertIn('"zone": "harpers"', writer_context)
+        self.assertIn('"disclosure": "FORBIDDEN"', writer_context)
+        self.assertIn("Awareness is not permission to disclose.", writer_context)
         self.assertIn(private_phrase, auditor_context)
         self.assertIn("the-study", auditor_context)
         self.assertIn('"disclosure": "FORBIDDEN"', auditor_context)
         self.assertIn('"tools_allowed": false', auditor_context)
-        self.assertIn("CONFIDENTIAL TOOL-FREE CONTINUITY AUDITOR POLICY", auditor_context)
+        self.assertIn(
+            "CONFIDENTIAL TOOL-FREE CONTINUITY AND AUDIENCE AUDITOR POLICY",
+            auditor_context,
+        )
 
-    def test_auditor_context_excludes_allowed_events(self) -> None:
+    def test_writer_and_auditor_receive_full_awareness_with_markers(self) -> None:
         allowed_phrase = "Nest conversation may travel inward"
         forbidden_phrase = "Harpers conversation stays sealed"
         event_rows = [
@@ -353,9 +355,11 @@ class ContinuityPolicyTests(unittest.TestCase):
         writer_context = continuity.format_writer_context(context)
         auditor_context = continuity.format_auditor_context(context)
         self.assertIn(allowed_phrase, writer_context)
-        self.assertNotIn(forbidden_phrase, writer_context)
-        self.assertNotIn(allowed_phrase, auditor_context)
+        self.assertIn(forbidden_phrase, writer_context)
+        self.assertIn(allowed_phrase, auditor_context)
         self.assertIn(forbidden_phrase, auditor_context)
+        self.assertIn('"forbidden_event_count": 1', auditor_context)
+        self.assertIn("audience check", auditor_context)
 
     def test_unapproved_or_malformed_events_are_omitted_fail_closed(self) -> None:
         unapproved = self.event(

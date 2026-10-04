@@ -74,12 +74,13 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
                 continuity_allowed_contents=allowed_contents,
             )
 
-    async def test_writer_never_receives_forbidden_evidence_and_auditor_has_no_tools(self) -> None:
+    async def test_writer_receives_private_awareness_tool_free_and_auditor_has_no_tools(self) -> None:
         secret = "the private lantern is violet"
         create = AsyncMock(side_effect=[completion("Safe reply"), audit("ALLOW")])
 
         response = await self.generate(
             create,
+            writer_context=f"PRIVATE AWARENESS: {secret}",
             auditor_context=f"CONFIDENTIAL: {secret}",
             forbidden_contents=(secret,),
         )
@@ -88,9 +89,10 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
         writer_call, auditor_call = create.await_args_list
         writer_dump = json.dumps(writer_call.kwargs["messages"], ensure_ascii=False)
         auditor_dump = json.dumps(auditor_call.kwargs["messages"], ensure_ascii=False)
-        self.assertNotIn(secret, writer_dump)
-        self.assertIn("Allowed Nest receipt", writer_dump)
+        self.assertIn(secret, writer_dump)
+        self.assertIn(secret, writer_dump)
         self.assertIn(secret, auditor_dump)
+        self.assertEqual(writer_call.kwargs["tools"], [])
         self.assertEqual(auditor_call.kwargs["tools"], [])
         self.assertNotIn("temperature", auditor_call.kwargs)
         self.assertEqual(
@@ -189,7 +191,11 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
-        response = await self.generate(create)
+        response = await self.generate(
+            create,
+            auditor_context="Audience audit for allowed continuity",
+            forbidden_contents=(),
+        )
 
         self.assertEqual(
             response,
@@ -218,6 +224,33 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response, router.CompanionResponse(reply_text=restated))
         self.assertEqual(create.await_count, 2)
+
+    async def test_allowed_provenance_still_receives_an_audience_audit(self) -> None:
+        create = AsyncMock(
+            side_effect=[
+                completion("An explicit couple detail in front of company."),
+                audit("REJECT", "INTIMATE_DETAIL", "AUDIENCE_INAPPROPRIATE"),
+                completion("I know exactly what you mean, Goose."),
+                audit("ALLOW"),
+            ]
+        )
+
+        response = await self.generate(
+            create,
+            writer_context="ALLOWED Nest event with sensitive relationship context",
+            auditor_context="Current zone is nest; event is ALLOWED",
+            forbidden_contents=(),
+            allowed_contents=("Sensitive relationship context",),
+        )
+
+        self.assertEqual(
+            response,
+            router.CompanionResponse(reply_text="I know exactly what you mean, Goose."),
+        )
+        first_audit = create.await_args_list[1]
+        self.assertEqual(first_audit.kwargs["tools"], [])
+        self.assertIn("audience-inappropriate", first_audit.kwargs["messages"][0]["content"])
+        self.assertEqual(create.await_args_list[2].kwargs["tools"], [])
 
     def test_local_room_history_carries_an_explicit_age_marker(self) -> None:
         prepared = router._prepare_history(

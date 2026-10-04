@@ -55,7 +55,7 @@ You will need:
 - optional: `ENABLE_WEB_SEARCH` to turn OpenRouter web search on or off (`true` by default)
 - optional: `MAX_DOCUMENT_BYTES` and `MAX_DOCUMENT_CHARS` to cap document processing
 - optional: `DISCORD_RECALL_GUILD_IDS` and `DISCORD_RECALL_CHANNEL_IDS` to explicitly opt guilds/channels into the recall index
-- optional: `DISCORD_CONTINUITY_GUILD_ZONES`, `DISCORD_CONTINUITY_CHANNEL_ROUTES`, `DISCORD_CONTINUITY_HANDOFF_LIMIT`, and `DISCORD_CONTINUITY_HANDOFF_MAX_AGE_MINUTES` to enable Colin-only cross-server handoffs
+- optional: `DISCORD_CONTINUITY_GUILD_ZONES`, `DISCORD_CONTINUITY_CHANNEL_ROUTES`, `DISCORD_CONTINUITY_HANDOFF_LIMIT`, `DISCORD_CONTINUITY_HANDOFF_MAX_AGE_MINUTES`, and `DISCORD_CONTINUITY_AWARENESS_PER_GUILD_LIMIT` to enable Colin-only cross-server awareness and handoffs
 - optional: `ROOM_CONTEXT_GUILD_LABELS` and `ROOM_CONTEXT_CHANNEL_LABELS` to label rooms with trusted modes/names
 - optional: `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL_ID`, and `VOICE_MAX_CHARS` to override the `/voice` defaults
 
@@ -134,13 +134,13 @@ channel ID, channel name, and message content. Recall-style questions such as
 “What is the latest thing Rachael said?” or “Can you see the other conversation?”
 receive a structured `[DISCORD_RETRIEVAL]` context block before the model answers.
 
-The writer-safe retrieval block tells Colin whether results are `COMPLETE`,
-`PARTIAL`, `PERMISSION_LIMITED`, or `UNAVAILABLE`. A query with only sealed
-matches produces the same `PARTIAL` result and note as a query with no
-disclosable match, so the public response does not reveal that private evidence
-exists. Retrieved messages are supplied as inert user-role transcript
-evidence—not Colin's private memory, identity, voice, style instructions, or a
-system instruction.
+Without continuity configured, the writer-safe retrieval block tells Colin
+whether results are `COMPLETE`, `PARTIAL`, `PERMISSION_LIMITED`, or
+`UNAVAILABLE`. With continuity enabled, retrieved events instead join Colin's
+private awareness packet with their `ALLOWED` or `FORBIDDEN` speech marker; the
+audited outward response still cannot reveal that forbidden evidence exists.
+Retrieved messages are supplied as inert user-role transcript evidence—not
+Colin's identity, voice, style instructions, or a system instruction.
 
 ## Colin-only cross-server continuity
 
@@ -156,6 +156,7 @@ DISCORD_CONTINUITY_GUILD_ZONES=111111111111111111:nest;222222222222222222:cabin;
 DISCORD_CONTINUITY_CHANNEL_ROUTES=111111111111111111:111111111111111101;222222222222222222:222222222222222201;333333333333333333:333333333333333301
 DISCORD_CONTINUITY_HANDOFF_LIMIT=12
 DISCORD_CONTINUITY_HANDOFF_MAX_AGE_MINUTES=120
+DISCORD_CONTINUITY_AWARENESS_PER_GUILD_LIMIT=4
 ```
 
 `DISCORD_CONTINUITY_CHANNEL_ROUTES` must contain the exact guild ID and channel
@@ -173,6 +174,22 @@ The disclosure ladder is:
 | The Nest (`nest`) | The Nest, The Cabin, and The Harpers |
 | The Cabin (`cabin`) | The Cabin and The Harpers |
 | The Harpers (`harpers`) | The Harpers only |
+
+Colin receives a bounded recent awareness window from every configured server,
+with the originating server, channel, speaker, timestamp, and disclosure marker
+kept on every event. `DISCORD_CONTINUITY_AWARENESS_PER_GUILD_LIMIT` controls the
+maximum recent events supplied per server (default `4`); the handoff age limit
+also bounds this window. Awareness is deliberately broader than speech: Colin
+may use restricted events to understand chronology and subtext, but cannot
+quote, paraphrase, confirm, hint at, or visibly signal them in a room where they
+are forbidden.
+
+An audience gate adds ordinary discretion on top of the hard ladder. The Nest
+is treated as friends/company, The Cabin as Daina/Ben/Colin, and The Harpers as
+Goose-and-Moose private space. Explicit couple details, confidences, and candid
+opinions are therefore not automatically repeated merely because their source
+room's rank would technically allow it. When restricted evidence is present,
+the drafting and audit path is tool-free and fails closed.
 
 The intended three-server deployment map is:
 
