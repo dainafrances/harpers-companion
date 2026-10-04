@@ -484,7 +484,6 @@ async def _audit_continuity_candidate(
                 ),
             },
         ],
-        temperature=0,
         max_tokens=PRIVACY_AUDIT_MAX_TOKENS,
         tools=[],
         response_format=PRIVACY_AUDIT_RESPONSE_FORMAT,

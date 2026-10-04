@@ -92,7 +92,7 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Allowed Nest receipt", writer_dump)
         self.assertIn(secret, auditor_dump)
         self.assertEqual(auditor_call.kwargs["tools"], [])
-        self.assertEqual(auditor_call.kwargs["temperature"], 0)
+        self.assertNotIn("temperature", auditor_call.kwargs)
         self.assertEqual(
             auditor_call.kwargs["response_format"],
             router.PRIVACY_AUDIT_RESPONSE_FORMAT,
