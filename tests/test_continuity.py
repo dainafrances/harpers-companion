@@ -48,23 +48,23 @@ class ContinuityPolicyTests(unittest.TestCase):
             }[guild_id],
         }
 
-    def test_disclosure_matrix_is_nest_less_than_cabin_less_than_harpers(self) -> None:
+    def test_private_origin_matrix_is_nest_less_than_cabin_less_than_harpers(self) -> None:
         zones = (
             continuity.ContinuityZone.NEST,
             continuity.ContinuityZone.CABIN,
             continuity.ContinuityZone.HARPERS,
         )
         expected = {
-            continuity.ContinuityZone.NEST: (True, False, False),
-            continuity.ContinuityZone.CABIN: (True, True, False),
-            continuity.ContinuityZone.HARPERS: (True, True, True),
+            continuity.ContinuityZone.NEST: (False, True, True),
+            continuity.ContinuityZone.CABIN: (False, False, True),
+            continuity.ContinuityZone.HARPERS: (False, False, False),
         }
 
         for current_zone, row in expected.items():
             for source_zone, allowed in zip(zones, row, strict=True):
                 with self.subTest(current=current_zone, source=source_zone):
                     self.assertEqual(
-                        continuity.can_disclose(
+                        continuity.has_private_origin(
                             source_zone=source_zone,
                             current_zone=current_zone,
                         ),
@@ -220,8 +220,11 @@ class ContinuityPolicyTests(unittest.TestCase):
         self.assertEqual(context.events[1].event.channel_name, "the-bedroom")
         self.assertEqual(context.events[0].event.zone, continuity.ContinuityZone.CABIN)
         self.assertEqual(context.events[1].event.zone, continuity.ContinuityZone.HARPERS)
-        self.assertEqual(context.events[0].disclosure, continuity.DisclosureMarker.ALLOWED)
-        self.assertEqual(context.events[1].disclosure, continuity.DisclosureMarker.FORBIDDEN)
+        self.assertEqual(context.events[0].disclosure, continuity.DisclosureMarker.ROUTINE)
+        self.assertEqual(
+            context.events[1].disclosure,
+            continuity.DisclosureMarker.PRIVATE_ORIGIN,
+        )
 
     def test_prompt_format_preserves_verbatim_content_and_full_provenance(self) -> None:
         verbatim = '  “That was scandalous.”\nDo not trim this. 🫎💗🪿  '
@@ -243,16 +246,13 @@ class ContinuityPolicyTests(unittest.TestCase):
         self.assertIsNotNone(formatted)
         assert formatted is not None
         self.assertIn("Awareness is not permission to disclose.", formatted)
-        self.assertIn(
-            "forbidden facts may not be quoted, paraphrased, hinted at, confirmed, denied, or otherwise revealed",
-            formatted,
-        )
+        self.assertIn("Make the disclosure decision yourself", formatted)
         json_text = formatted.split("[CONTINUITY_CONTEXT]\n", 1)[1].rsplit(
             "\n[/CONTINUITY_CONTEXT]", 1
         )[0]
         payload = json.loads(json_text)
         prompt_event = payload["events"][0]
-        self.assertEqual(prompt_event["disclosure"], "ALLOWED")
+        self.assertEqual(prompt_event["disclosure"], "ROUTINE")
         self.assertEqual(prompt_event["zone"], "nest")
         self.assertTrue(prompt_event["content_is_verbatim"])
         self.assertEqual(prompt_event["content"], verbatim)
@@ -269,7 +269,7 @@ class ContinuityPolicyTests(unittest.TestCase):
         )
         self.assertEqual(prompt_event["provenance"]["source"], "observed-human")
 
-    def test_harpers_event_is_present_but_forbidden_in_nest(self) -> None:
+    def test_harpers_event_is_present_as_private_origin_in_nest(self) -> None:
         private_phrase = "Private Goose and Moose only talk"
         event_rows = [
             self.event(
@@ -290,7 +290,10 @@ class ContinuityPolicyTests(unittest.TestCase):
         self.assertIsNotNone(context)
         assert context is not None
         self.assertEqual(len(context.events), 1)
-        self.assertEqual(context.events[0].disclosure, continuity.DisclosureMarker.FORBIDDEN)
+        self.assertEqual(
+            context.events[0].disclosure,
+            continuity.DisclosureMarker.PRIVATE_ORIGIN,
+        )
 
         writer_context = continuity.build_and_format_prompt_context(
             event_rows,
@@ -312,11 +315,11 @@ class ContinuityPolicyTests(unittest.TestCase):
         self.assertIn(private_phrase, writer_context)
         self.assertIn("the-study", writer_context)
         self.assertIn('"zone": "harpers"', writer_context)
-        self.assertIn('"disclosure": "FORBIDDEN"', writer_context)
+        self.assertIn('"disclosure": "PRIVATE_ORIGIN"', writer_context)
         self.assertIn("Awareness is not permission to disclose.", writer_context)
         self.assertIn(private_phrase, auditor_context)
         self.assertIn("the-study", auditor_context)
-        self.assertIn('"disclosure": "FORBIDDEN"', auditor_context)
+        self.assertIn('"disclosure": "PRIVATE_ORIGIN"', auditor_context)
         self.assertIn('"tools_allowed": false', auditor_context)
         self.assertIn(
             "CONFIDENTIAL TOOL-FREE CONTINUITY AND AUDIENCE AUDITOR POLICY",
@@ -358,7 +361,7 @@ class ContinuityPolicyTests(unittest.TestCase):
         self.assertIn(forbidden_phrase, writer_context)
         self.assertIn(allowed_phrase, auditor_context)
         self.assertIn(forbidden_phrase, auditor_context)
-        self.assertIn('"forbidden_event_count": 1', auditor_context)
+        self.assertIn('"private_origin_event_count": 1', auditor_context)
         self.assertIn("audience check", auditor_context)
 
     def test_unapproved_or_malformed_events_are_omitted_fail_closed(self) -> None:
