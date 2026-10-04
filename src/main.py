@@ -87,6 +87,16 @@ CONTINUITY_HANDOFF_MAX_AGE_MINUTES = min(
     24 * 60,
     max(1, _continuity_handoff_max_age_raw),
 )
+try:
+    _continuity_awareness_per_guild_limit_raw = int(
+        os.getenv("DISCORD_CONTINUITY_AWARENESS_PER_GUILD_LIMIT", "4").strip()
+    )
+except ValueError:
+    _continuity_awareness_per_guild_limit_raw = 4
+CONTINUITY_AWARENESS_PER_GUILD_LIMIT = min(
+    12,
+    max(1, _continuity_awareness_per_guild_limit_raw),
+)
 
 # Comma-separated list of other companion bot names (display/global/name).
 COMPANION_BOT_NAMES_RAW = os.getenv(
@@ -632,7 +642,34 @@ def _build_continuity_prompt_inputs(
         return ContinuityPromptInputs()
 
     current_timestamp = _message_event_timestamp(message)
+    current_datetime = datetime.fromisoformat(
+        current_timestamp.replace("Z", "+00:00")
+    ).astimezone(timezone.utc)
     event_rows: list[dict[str, object]] = []
+
+    # Give Colin a small, recent awareness window from every configured server.
+    # The current channel already has ordinary local history, so only other rooms
+    # are added for the current guild. Exact approved routes keep this fail-closed.
+    awareness_cutoff = (
+        current_datetime - timedelta(minutes=CONTINUITY_HANDOFF_MAX_AGE_MINUTES)
+    ).isoformat()
+    approved_channels_by_guild: dict[int, set[str]] = {}
+    for guild_id, channel_id in continuity_config.approved_channel_routes:
+        approved_channels_by_guild.setdefault(guild_id, set()).add(str(channel_id))
+    for guild_id, approved_channel_ids in approved_channels_by_guild.items():
+        event_rows.extend(
+            memory.get_recent_continuity_events_from_guild_before(
+                guild_id=str(guild_id),
+                approved_channel_ids=approved_channel_ids,
+                before_timestamp=current_timestamp,
+                after_timestamp=awareness_cutoff,
+                limit=CONTINUITY_AWARENESS_PER_GUILD_LIMIT,
+                exclude_channel_id=(
+                    str(message.channel.id) if guild_id == message.guild.id else None
+                ),
+            )
+        )
+
     anchor = _latest_relevant_continuity_event(
         before_timestamp=current_timestamp,
         current_speaker_id=message.author.id,
@@ -645,9 +682,6 @@ def _build_continuity_prompt_inputs(
             str(anchor.get("channel_id", "")),
         )
         anchor_timestamp = _parsed_event_timestamp(anchor)
-        current_datetime = datetime.fromisoformat(
-            current_timestamp.replace("Z", "+00:00")
-        ).astimezone(timezone.utc)
         anchor_age = (
             current_datetime - anchor_timestamp
             if anchor_timestamp is not None
@@ -701,16 +735,8 @@ def _build_continuity_prompt_inputs(
         if item.disclosure is continuity.DisclosureMarker.FORBIDDEN
     )
     return ContinuityPromptInputs(
-        writer_context=(
-            continuity.format_writer_context(prompt_context)
-            if allowed_contents
-            else None
-        ),
-        auditor_context=(
-            continuity.format_auditor_context(prompt_context)
-            if forbidden_contents
-            else None
-        ),
+        writer_context=continuity.format_writer_context(prompt_context),
+        auditor_context=continuity.format_auditor_context(prompt_context),
         allowed_contents=allowed_contents,
         forbidden_contents=forbidden_contents,
     )
@@ -761,13 +787,10 @@ def _discord_retrieval_for_prompt(
         continuity_config=continuity_config,
     )
     return RecallPromptInputs(
-        writer_context=discord_recall.format_disclosure_aware_writer_context(
-            query=cleaned_content,
-            result=result,
-            guild_id=guild_id,
-            channel_id=channel_id,
-            include_messages=False,
-        ),
+        # The continuity packet below carries every matched approved event with
+        # its speech permission. A second "no disclosable result" summary here
+        # would wrongly tell Colin that he cannot see private continuity.
+        writer_context=None,
         event_rows=tuple([*result.writer_messages, *result.auditor_messages]),
     )
 
@@ -1087,7 +1110,8 @@ async def on_ready() -> None:
         f"guild_ids={continuity_guild_ids}; routes={continuity_routes}; "
         f"route_count={len(continuity_routes)}; config_error_count={len(continuity_config.errors)}; "
         f"handoff_limit={CONTINUITY_HANDOFF_LIMIT}; "
-        f"handoff_max_age_minutes={CONTINUITY_HANDOFF_MAX_AGE_MINUTES}."
+        f"handoff_max_age_minutes={CONTINUITY_HANDOFF_MAX_AGE_MINUTES}; "
+        f"awareness_per_guild_limit={CONTINUITY_AWARENESS_PER_GUILD_LIMIT}."
     )
     _debug_log(f"Owner ID: {owner_id}")
     _debug_log(f"Companion bot names: {sorted(companion_bot_names)}")

@@ -362,6 +362,67 @@ def get_recent_continuity_events_from_channel_before(
     return [_continuity_event_from_row(row) for row in reversed(rows)]
 
 
+def get_recent_continuity_events_from_guild_before(
+    *,
+    guild_id: str,
+    approved_channel_ids: set[str],
+    before_timestamp: str,
+    after_timestamp: str,
+    limit: int,
+    exclude_channel_id: str | None = None,
+) -> list[dict[str, str | bool]]:
+    """Return a bounded chronological awareness window from approved guild routes."""
+    if limit <= 0 or not approved_channel_ids:
+        return []
+
+    channel_ids = sorted(approved_channel_ids)
+    placeholders = ",".join("?" for _ in channel_ids)
+    clauses = [
+        "guild_id = ?",
+        f"channel_id IN ({placeholders})",
+        "event_timestamp < ?",
+        "event_timestamp >= ?",
+    ]
+    params: list[object] = [
+        guild_id,
+        *channel_ids,
+        before_timestamp,
+        after_timestamp,
+    ]
+    if exclude_channel_id is not None:
+        clauses.append("channel_id != ?")
+        params.append(exclude_channel_id)
+    params.append(limit)
+
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT
+                event_id,
+                guild_id,
+                guild_name,
+                channel_id,
+                channel_name,
+                continuity_zone,
+                speaker_user_id,
+                speaker_name,
+                speaker_is_bot,
+                role,
+                content,
+                event_timestamp,
+                source,
+                indexed_at
+            FROM continuity_events
+            WHERE {' AND '.join(clauses)}
+            ORDER BY event_timestamp DESC, event_id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+
+    return [_continuity_event_from_row(row) for row in reversed(rows)]
+
+
 def search_recall_messages(
     *,
     allowed_guild_ids: set[str] | None = None,

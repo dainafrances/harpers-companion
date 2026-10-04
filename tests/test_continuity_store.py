@@ -194,6 +194,35 @@ class ContinuityStoreTests(unittest.TestCase):
             [],
         )
 
+    def test_recent_guild_awareness_uses_only_approved_routes_and_time_window(self) -> None:
+        self.save_event("approved-old", "2026-10-02T20:00:00+00:00", "Too old")
+        self.save_event("approved-a", "2026-10-02T21:10:00+00:00", "Approved A")
+        self.save_event(
+            "approved-b",
+            "2026-10-02T21:20:00+00:00",
+            "Approved B",
+            channel_id="nest-colin",
+            channel_name="colin",
+        )
+        self.save_event(
+            "unapproved",
+            "2026-10-02T21:30:00+00:00",
+            "Must stay out",
+            channel_id="nest-secret",
+            channel_name="secret",
+        )
+
+        events = memory.get_recent_continuity_events_from_guild_before(
+            guild_id="nest-guild",
+            approved_channel_ids={"nest-everyone", "nest-colin"},
+            before_timestamp="2026-10-02T22:00:00+00:00",
+            after_timestamp="2026-10-02T21:00:00+00:00",
+            limit=5,
+            exclude_channel_id="nest-everyone",
+        )
+
+        self.assertEqual([event["event_id"] for event in events], ["approved-b"])
+
     def test_expected_chronology_indexes_exist(self) -> None:
         with memory.connect() as conn:
             indexes = {
