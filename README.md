@@ -191,8 +191,12 @@ Goose-and-Moose private space. Explicit couple details, confidences, and candid
 opinions remain protected when the current audience is unsuitable. Ordinary,
 non-sensitive context can be acknowledged across rooms when Colin judges that
 doing so is socially natural and does not betray anyone's confidence. When
-continuity evidence is present, drafting and auditing remain tool-free and an
-auditor failure is retried once before the response path fails closed. A discreet
+continuity evidence is present, drafting may propose a local reaction, but no
+external action runs before the complete reply is audited without tools. An
+auditor failure is retried once. If a proposed reply is rejected, the recovery
+draft omits imported room transcripts. If no draft passes, Colin sends a short
+detail-free reply instead of disappearing; rejected words and reactions are
+never sent. A discreet
 acknowledgement that Colin remembers prior context is not itself treated as a
 disclosure when it reveals no detail, paraphrase, identifying hint, or knowing
 reaction.

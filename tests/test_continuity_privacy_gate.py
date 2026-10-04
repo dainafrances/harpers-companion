@@ -125,6 +125,7 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
 
         response = await self.generate(
             create,
+            writer_context=f"PRIVATE AWARENESS: {secret}",
             auditor_context=f"CONFIDENTIAL: {secret}",
             private_origin_contents=(secret,),
         )
@@ -141,6 +142,7 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(regeneration_call.kwargs["tools"], [])
         self.assertIn("PRIVACY CORRECTION", regeneration_dump)
         self.assertNotIn(secret, regeneration_dump)
+        self.assertNotIn(router.CONTINUITY_EVIDENCE_OPEN, regeneration_dump)
 
     async def test_malformed_audit_is_rejection_then_safe_regeneration(self) -> None:
         create = AsyncMock(
@@ -181,7 +183,7 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(create.await_count, 3)
 
-    async def test_second_audit_failure_blocks_reply_and_reactions(self) -> None:
+    async def test_second_audit_failure_uses_content_free_reply(self) -> None:
         create = AsyncMock(
             side_effect=[
                 completion("I know exactly what you mean."),
@@ -195,8 +197,101 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
 
         response = await self.generate(create)
 
-        self.assertEqual(response, router.CompanionResponse())
+        self.assertEqual(
+            response,
+            router.CompanionResponse(reply_text=router.CONTINUITY_FAILURE_REPLY),
+        )
+        self.assertNotIn("private lantern", response.reply_text)
+        self.assertEqual(response.reaction_emojis, ())
         self.assertEqual(create.await_count, 6)
+
+    async def test_two_confidence_rejections_do_not_silence_colin(self) -> None:
+        secret = "the private lantern is violet"
+        reaction_call = SimpleNamespace(
+            id="react-1",
+            function=SimpleNamespace(
+                name="react_to_message",
+                arguments=json.dumps({"emojis": ["🤫"]}),
+            ),
+        )
+        create = AsyncMock(
+            side_effect=[
+                completion(None, tool_calls=[reaction_call]),
+                completion(f"We discussed {secret}."),
+                audit("REJECT", "PARAPHRASE", "REACTION_SIGNAL", "EXPLICIT_CONFIDENCE"),
+                completion("I can hint at our private lantern."),
+                audit("REJECT", "PARAPHRASE", "EXPLICIT_CONFIDENCE"),
+            ]
+        )
+
+        response = await self.generate(
+            create,
+            user_text="Do you remember what we were just discussing?",
+            writer_context=f"PRIVATE AWARENESS: {secret}",
+            auditor_context=f"CONFIDENTIAL: {secret}",
+            private_origin_contents=(secret,),
+            couple_private_contents=(secret,),
+        )
+
+        self.assertEqual(
+            response,
+            router.CompanionResponse(reply_text=router.CONTINUITY_MEMORY_ACK_REPLY),
+        )
+        self.assertNotIn(secret, response.reply_text)
+        self.assertEqual(response.reaction_emojis, ())
+        recovery_messages = create.await_args_list[3].kwargs["messages"]
+        self.assertNotIn(secret, json.dumps(recovery_messages, ensure_ascii=False))
+        self.assertEqual(create.await_args_list[3].kwargs["tools"], [])
+
+    async def test_regeneration_error_uses_content_free_reply(self) -> None:
+        create = AsyncMock(
+            side_effect=[
+                completion("A rejected private detail"),
+                audit("REJECT", "EXPLICIT_CONFIDENCE"),
+                RuntimeError("writer unavailable"),
+            ]
+        )
+
+        response = await self.generate(create)
+
+        self.assertEqual(
+            response,
+            router.CompanionResponse(reply_text=router.CONTINUITY_FAILURE_REPLY),
+        )
+        self.assertEqual(create.await_count, 3)
+
+    async def test_non_owner_does_not_get_owner_memory_acknowledgement(self) -> None:
+        secret = "the private lantern is violet"
+        create = AsyncMock(
+            side_effect=[
+                completion(secret),
+                audit("REJECT", "EXPLICIT_CONFIDENCE"),
+                completion(secret),
+                audit("REJECT", "EXPLICIT_CONFIDENCE"),
+            ]
+        )
+
+        response = await self.generate(
+            create,
+            user_text="Do you remember what Daina discussed?",
+            speaker_is_owner=False,
+            private_origin_contents=(secret,),
+            couple_private_contents=(secret,),
+        )
+
+        self.assertEqual(
+            response,
+            router.CompanionResponse(reply_text=router.CONTINUITY_FAILURE_REPLY),
+        )
+        self.assertNotIn(secret, response.reply_text)
+
+    async def test_initial_choice_to_stay_silent_is_preserved(self) -> None:
+        create = AsyncMock(side_effect=[completion(None)])
+
+        response = await self.generate(create)
+
+        self.assertEqual(response, router.CompanionResponse())
+        self.assertEqual(create.await_count, 1)
 
     async def test_discreet_memory_acknowledgement_is_not_a_blanket_violation(self) -> None:
         reply = "I remember what we discussed, and I'm keeping the detail between us."
