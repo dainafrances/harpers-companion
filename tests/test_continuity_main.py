@@ -153,6 +153,7 @@ class ContinuityMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         speaker: FakeAuthor,
         timestamp: str,
         role: str | None = None,
+        source: str | None = None,
     ) -> None:
         memory.save_continuity_event(
             event_id=event_id,
@@ -167,7 +168,7 @@ class ContinuityMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             role=role or ("assistant" if speaker.bot else "user"),
             content=content,
             event_timestamp=timestamp,
-            source="generated-colin" if speaker.bot else "observed-human",
+            source=source or ("generated-colin" if speaker.bot else "observed-human"),
         )
 
     def test_transition_uses_actual_newest_owner_or_colin_event(self) -> None:
@@ -209,10 +210,10 @@ class ContinuityMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Newest Cabin exchange", inputs.writer_context)
         self.assertIn("Older Nest exchange", inputs.writer_context)
         self.assertEqual(
-            inputs.allowed_contents,
+            inputs.routine_contents,
             ("Older Nest exchange", "Newest Cabin exchange"),
         )
-        self.assertEqual(inputs.forbidden_contents, ())
+        self.assertEqual(inputs.private_origin_contents, ())
         self.assertIsNotNone(inputs.auditor_context)
 
     def test_same_room_activity_does_not_create_stale_handoff(self) -> None:
@@ -287,7 +288,7 @@ class ContinuityMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Recent Cabin context", inputs.writer_context)
         self.assertIn("Recent Harpers context", inputs.writer_context)
         self.assertEqual(
-            inputs.forbidden_contents,
+            inputs.private_origin_contents,
             ("Recent Cabin context", "Recent Harpers context"),
         )
         self.assertIsNotNone(inputs.auditor_context)
@@ -440,9 +441,9 @@ class ContinuityMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         assert inputs.writer_context is not None
         self.assertIn(scandal, inputs.writer_context)
         self.assertIn('"speaker_name": "Ben"', inputs.writer_context)
-        self.assertEqual(inputs.forbidden_contents, ())
+        self.assertEqual(inputs.private_origin_contents, ())
 
-    def test_private_transition_is_visible_to_colin_but_forbidden_to_repeat(self) -> None:
+    def test_private_transition_is_visible_to_colin_and_marked_for_judgement(self) -> None:
         secret = "Harpers-only confidence"
         self.seed_event(
             "private-owner",
@@ -462,12 +463,64 @@ class ContinuityMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(inputs.writer_context)
         assert inputs.writer_context is not None
         self.assertIn(secret, inputs.writer_context)
-        self.assertIn('"disclosure": "FORBIDDEN"', inputs.writer_context)
+        self.assertIn('"disclosure": "PRIVATE_ORIGIN"', inputs.writer_context)
         self.assertIsNotNone(inputs.auditor_context)
         assert inputs.auditor_context is not None
         self.assertIn(secret, inputs.auditor_context)
-        self.assertEqual(inputs.allowed_contents, ())
-        self.assertEqual(inputs.forbidden_contents, (secret,))
+        self.assertEqual(inputs.routine_contents, ())
+        self.assertEqual(inputs.private_origin_contents, (secret,))
+        self.assertEqual(inputs.couple_private_contents, (secret,))
+
+    def test_couple_private_context_excludes_other_people_private_words(self) -> None:
+        ben = FakeAuthor(88, "Ben", bot=True)
+        owner_secret = "Daina's private detail"
+        colin_secret = "Colin's private reply"
+        ben_secret = "Ben's private statement"
+        shared = {
+            "guild_id": 300,
+            "guild_name": "The Harpers",
+            "channel_id": 301,
+            "channel_name": "the-hearth",
+            "zone": "harpers",
+        }
+        self.seed_event(
+            "owner-private",
+            owner_secret,
+            speaker=self.owner,
+            timestamp="2026-10-03T11:00:00+00:00",
+            **shared,
+        )
+        self.seed_event(
+            "colin-private",
+            colin_secret,
+            speaker=self.colin,
+            timestamp="2026-10-03T11:01:00+00:00",
+            **shared,
+        )
+        self.seed_event(
+            "ben-private",
+            ben_secret,
+            speaker=ben,
+            source="observed-companion-bot",
+            timestamp="2026-10-03T11:02:00+00:00",
+            **shared,
+        )
+        current = self.message(
+            516,
+            "You have my permission to share our Harpers exchange here.",
+            timestamp="2026-10-03T12:00:00+00:00",
+        )
+
+        inputs = main._build_continuity_prompt_inputs(current, is_dm=False)
+
+        self.assertEqual(
+            inputs.couple_private_contents,
+            (owner_secret, colin_secret),
+        )
+        self.assertEqual(
+            inputs.private_origin_contents,
+            (owner_secret, colin_secret, ben_secret),
+        )
 
     def test_private_handoff_remains_sealed_after_a_public_arrival_greeting(self) -> None:
         secret = "The Harpers-only confidence survives as audit evidence."
@@ -577,8 +630,10 @@ class ContinuityMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(kwargs["latest_journal"])
         self.assertIn(secret, kwargs["continuity_writer_context"])
         self.assertIn(secret, kwargs["continuity_auditor_context"])
-        self.assertEqual(kwargs["continuity_allowed_contents"], ())
-        self.assertEqual(kwargs["continuity_forbidden_contents"], (secret,))
+        self.assertEqual(kwargs["continuity_routine_contents"], ())
+        self.assertEqual(kwargs["continuity_private_origin_contents"], (secret,))
+        self.assertEqual(kwargs["continuity_couple_private_contents"], (secret,))
+        self.assertEqual(kwargs["direct_owner_message_text"], "Colin, public now")
         legacy_recall.assert_not_called()
         self.assertEqual(message.added_reactions, ["💚"])
         self.assertEqual(message.channel.sent[0][0], "Safe public reply")
@@ -626,7 +681,7 @@ class ContinuityMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         legacy_messages = memory.get_recent_messages(channel_id=101, limit=10)
         self.assertFalse(any(row["role"] == "assistant" for row in legacy_messages))
 
-    async def test_explicit_recall_gives_colin_harpers_awareness_but_marks_it_forbidden(self) -> None:
+    async def test_explicit_recall_gives_colin_harpers_awareness_with_private_origin(self) -> None:
         secret = "Goose and Moose private ledger detail"
         memory.save_recall_message(
             message_id="private-recall",
@@ -663,9 +718,9 @@ class ContinuityMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         kwargs = generate.await_args.kwargs
         self.assertIsNone(kwargs["discord_retrieval_context"])
         self.assertIn(secret, kwargs["continuity_writer_context"])
-        self.assertIn('"disclosure": "FORBIDDEN"', kwargs["continuity_writer_context"])
+        self.assertIn('"disclosure": "PRIVATE_ORIGIN"', kwargs["continuity_writer_context"])
         self.assertIn(secret, kwargs["continuity_auditor_context"])
-        self.assertEqual(kwargs["continuity_forbidden_contents"], (secret,))
+        self.assertEqual(kwargs["continuity_private_origin_contents"], (secret,))
 
     def test_journal_is_harpers_only_when_enabled_and_legacy_when_disabled(self) -> None:
         memory.save_journal_entry(title="Continuity", content="Private journal content")

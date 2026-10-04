@@ -204,11 +204,11 @@ def retrieve_for_query_with_disclosure(
     limit: int = 8,
 ) -> DisclosureAwareRecallResult:
     """
-    Retrieve explicit recall with the destination room's disclosure policy.
+    Retrieve explicit recall with destination-aware origin sensitivity.
 
-    ``writer_messages`` contains only events that may be disclosed in the
-    destination. ``auditor_messages`` is confidential evidence for a separate,
-    tool-free auditor and must never be added to the outward-writer prompt.
+    ``writer_messages`` contains routine-origin events. ``auditor_messages``
+    contains more-private-origin events. Main merges both into Colin's private
+    awareness and the tool-free auditor checks his outward judgement.
     """
     permissions = permissions or permissions_from_env()
     if continuity_config is None or not continuity_config.enabled:
@@ -260,15 +260,15 @@ def retrieve_for_query_with_disclosure(
         if (not permissions.guild_ids or route_guild_id in permissions.guild_ids)
         and (not permissions.channel_ids or route_channel_id in permissions.channel_ids)
     }
-    visible_routes = {
+    routine_routes = {
         route
         for route in permitted_routes
-        if continuity.can_disclose(
+        if not continuity.has_private_origin(
             source_zone=continuity_config.guild_zones[route[0]],
             current_zone=current_zone,
         )
     }
-    sealed_routes = permitted_routes - visible_routes
+    private_origin_routes = permitted_routes - routine_routes
 
     speaker_user_id, speaker_name = _requested_speaker(query)
     nth = _requested_nth(query)
@@ -290,11 +290,9 @@ def retrieve_for_query_with_disclosure(
             limit=search_limit,
         )
 
-    visible_rows = search_routes(visible_routes, search_limit=max(limit, nth))
-    # Sealed evidence is bounded independently. It is used only by the tool-free
-    # auditor and never changes visible latest/Nth ordering.
-    sealed_rows = search_routes(sealed_routes, search_limit=max(1, limit))
-    if not visible_rows and not sealed_rows:
+    routine_rows = search_routes(routine_routes, search_limit=max(limit, nth))
+    private_origin_rows = search_routes(private_origin_routes, search_limit=max(1, limit))
+    if not routine_rows and not private_origin_rows:
         return DisclosureAwareRecallResult(
             status=RecallStatus.PARTIAL,
             writer_messages=(),
@@ -302,19 +300,19 @@ def retrieve_for_query_with_disclosure(
             note=NO_DISCLOSABLE_RESULTS_NOTE,
         )
 
-    visible_context = continuity.build_prompt_context(
-        visible_rows,
+    routine_context = continuity.build_prompt_context(
+        routine_rows,
         current_guild_id=guild_id,
         current_channel_id=channel_id,
         config=continuity_config,
     )
-    sealed_context = continuity.build_prompt_context(
-        sealed_rows,
+    private_origin_context = continuity.build_prompt_context(
+        private_origin_rows,
         current_guild_id=guild_id,
         current_channel_id=channel_id,
         config=continuity_config,
     )
-    if visible_context is None or sealed_context is None:
+    if routine_context is None or private_origin_context is None:
         return DisclosureAwareRecallResult(
             status=RecallStatus.PERMISSION_LIMITED,
             writer_messages=(),
@@ -322,33 +320,33 @@ def retrieve_for_query_with_disclosure(
             note="This guild/channel is not an approved continuity route.",
         )
 
-    deduplicated_visible = sorted(
-        _deduplicate_prompt_events(visible_context.events),
+    deduplicated_routine = sorted(
+        _deduplicate_prompt_events(routine_context.events),
         key=_prompt_event_recency_key,
         reverse=True,
     )
-    deduplicated_sealed = sorted(
-        _deduplicate_prompt_events(sealed_context.events),
+    deduplicated_private_origin = sorted(
+        _deduplicate_prompt_events(private_origin_context.events),
         key=_prompt_event_recency_key,
         reverse=True,
     )
-    disclosable = [
+    routine = [
         _recall_row_from_event(item.event)
-        for item in deduplicated_visible
-        if item.disclosure is continuity.DisclosureMarker.ALLOWED
+        for item in deduplicated_routine
+        if item.disclosure is continuity.DisclosureMarker.ROUTINE
     ]
-    forbidden = tuple(
+    private_origin = tuple(
         _recall_row_from_event(item.event)
-        for item in deduplicated_sealed
-        if item.disclosure is continuity.DisclosureMarker.FORBIDDEN
+        for item in deduplicated_private_origin
+        if item.disclosure is continuity.DisclosureMarker.PRIVATE_ORIGIN
     )
 
-    if not disclosable:
-        if forbidden:
+    if not routine:
+        if private_origin:
             return DisclosureAwareRecallResult(
                 status=RecallStatus.PARTIAL,
                 writer_messages=(),
-                auditor_messages=forbidden,
+                auditor_messages=private_origin,
                 note=NO_DISCLOSABLE_RESULTS_NOTE,
             )
         return DisclosureAwareRecallResult(
@@ -359,21 +357,21 @@ def retrieve_for_query_with_disclosure(
         )
 
     if nth > 1:
-        selected = disclosable[nth - 1 : nth]
+        selected = routine[nth - 1 : nth]
         if not selected:
             return DisclosureAwareRecallResult(
                 status=RecallStatus.PARTIAL,
                 writer_messages=(),
-                auditor_messages=forbidden,
+                auditor_messages=private_origin,
                 note="There were fewer indexed messages than requested.",
             )
     else:
-        selected = disclosable[:limit]
+        selected = routine[:limit]
 
     return DisclosureAwareRecallResult(
         status=RecallStatus.COMPLETE,
         writer_messages=tuple(selected),
-        auditor_messages=forbidden,
+        auditor_messages=private_origin,
         note="Retrieved from approved indexed Discord history.",
     )
 

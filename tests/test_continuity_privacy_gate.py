@@ -49,10 +49,14 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
         create: AsyncMock,
         *,
         user_text: str = "We are back in The Nest.",
-        writer_context: str = "Allowed Nest receipt",
-        auditor_context: str = "Forbidden Harpers receipt",
-        forbidden_contents: tuple[str, ...] = ("the private lantern is violet",),
-        allowed_contents: tuple[str, ...] = ("Allowed Nest receipt",),
+        writer_context: str = "Routine Nest receipt",
+        auditor_context: str = "Private-origin Harpers receipt",
+        private_origin_contents: tuple[str, ...] = ("the private lantern is violet",),
+        routine_contents: tuple[str, ...] = ("Routine Nest receipt",),
+        history: list[dict[str, str]] | None = None,
+        speaker_is_owner: bool = True,
+        direct_owner_message_text: str | None = None,
+        couple_private_contents: tuple[str, ...] = (),
     ) -> router.CompanionResponse:
         fake_client = SimpleNamespace(
             chat=SimpleNamespace(completions=SimpleNamespace(create=create))
@@ -63,15 +67,17 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
         ):
             return await router.generate_companion_reply(
                 user_text=user_text,
-                history=[],
+                history=history or [],
                 latest_journal=None,
                 is_dm=False,
                 speaker_name="Daina",
-                speaker_is_owner=True,
+                speaker_is_owner=speaker_is_owner,
                 continuity_writer_context=writer_context,
                 continuity_auditor_context=auditor_context,
-                continuity_forbidden_contents=forbidden_contents,
-                continuity_allowed_contents=allowed_contents,
+                continuity_private_origin_contents=private_origin_contents,
+                continuity_routine_contents=routine_contents,
+                continuity_couple_private_contents=couple_private_contents,
+                direct_owner_message_text=direct_owner_message_text,
             )
 
     async def test_writer_receives_private_awareness_tool_free_and_auditor_has_no_tools(self) -> None:
@@ -82,7 +88,7 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
             create,
             writer_context=f"PRIVATE AWARENESS: {secret}",
             auditor_context=f"CONFIDENTIAL: {secret}",
-            forbidden_contents=(secret,),
+            private_origin_contents=(secret,),
         )
 
         self.assertEqual(response, router.CompanionResponse(reply_text="Safe reply"))
@@ -90,9 +96,11 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
         writer_dump = json.dumps(writer_call.kwargs["messages"], ensure_ascii=False)
         auditor_dump = json.dumps(auditor_call.kwargs["messages"], ensure_ascii=False)
         self.assertIn(secret, writer_dump)
-        self.assertIn(secret, writer_dump)
         self.assertIn(secret, auditor_dump)
-        self.assertEqual(writer_call.kwargs["tools"], [])
+        self.assertEqual(
+            writer_call.kwargs["tools"][0]["function"]["name"],
+            "react_to_message",
+        )
         self.assertEqual(auditor_call.kwargs["tools"], [])
         self.assertNotIn("temperature", auditor_call.kwargs)
         self.assertEqual(
@@ -109,6 +117,7 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
         create = AsyncMock(
             side_effect=[
                 completion(f"You said {secret}."),
+                audit("REJECT", "EXPLICIT_CONFIDENCE"),
                 completion("Lovely weather for nonsense."),
                 audit("ALLOW"),
             ]
@@ -117,15 +126,15 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
         response = await self.generate(
             create,
             auditor_context=f"CONFIDENTIAL: {secret}",
-            forbidden_contents=(secret,),
+            private_origin_contents=(secret,),
         )
 
         self.assertEqual(
             response,
             router.CompanionResponse(reply_text="Lovely weather for nonsense."),
         )
-        self.assertEqual(create.await_count, 3)
-        regeneration_call = create.await_args_list[1]
+        self.assertEqual(create.await_count, 4)
+        regeneration_call = create.await_args_list[2]
         regeneration_dump = json.dumps(
             regeneration_call.kwargs["messages"], ensure_ascii=False
         )
@@ -194,7 +203,7 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
         response = await self.generate(
             create,
             auditor_context="Audience audit for allowed continuity",
-            forbidden_contents=(),
+            private_origin_contents=(),
         )
 
         self.assertEqual(
@@ -209,6 +218,7 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
             "https://example.com/private-looking-path",
             first_audit_payload["candidate"]["reply_text"],
         )
+        self.assertEqual(create.await_args_list[1].kwargs["tools"], [])
         self.assertEqual(create.await_args_list[3].kwargs["tools"], [])
 
     async def test_current_room_restatement_is_not_deterministically_blocked(self) -> None:
@@ -219,13 +229,170 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
             create,
             user_text=f"I am saying this here now: {restated}",
             auditor_context=f"CONFIDENTIAL: {restated}",
-            forbidden_contents=(restated,),
+            private_origin_contents=(restated,),
         )
 
         self.assertEqual(response, router.CompanionResponse(reply_text=restated))
         self.assertEqual(create.await_count, 2)
 
-    async def test_allowed_provenance_still_receives_an_audience_audit(self) -> None:
+    async def test_ordinary_private_origin_context_can_be_shared_by_judgement(self) -> None:
+        ordinary_context = "we picked a film in The Harpers"
+        create = AsyncMock(side_effect=[completion(ordinary_context), audit("ALLOW")])
+
+        response = await self.generate(
+            create,
+            writer_context=f'PRIVATE_ORIGIN ordinary event: "{ordinary_context}"',
+            auditor_context=f'Current zone cabin; PRIVATE_ORIGIN: "{ordinary_context}"',
+            private_origin_contents=(ordinary_context,),
+            direct_owner_message_text=None,
+        )
+
+        self.assertEqual(
+            response,
+            router.CompanionResponse(reply_text=ordinary_context),
+        )
+        audit_payload = json.loads(create.await_args_list[1].kwargs["messages"][1]["content"])
+        self.assertEqual(audit_payload["direct_owner_message_text"], "")
+        self.assertEqual(
+            audit_payload["private_origin_event_contents"],
+            [ordinary_context],
+        )
+
+    async def test_owner_permission_widens_options_without_commanding_disclosure(self) -> None:
+        secret = "the brass key is beneath the violet cushion"
+        release = "It's okay, you can say it."
+        create = AsyncMock(side_effect=[completion(secret), audit("ALLOW")])
+
+        response = await self.generate(
+            create,
+            user_text=release,
+            writer_context=f'PRIVATE_ORIGIN owner event: "{secret}"',
+            auditor_context=f'Current zone cabin; PRIVATE_ORIGIN: "{secret}"',
+            private_origin_contents=(secret,),
+            history=[
+                {
+                    "role": "user",
+                    "content": "Can you tell me what we just discussed in The Harpers?",
+                },
+                {
+                    "role": "assistant",
+                    "content": "That Harpers-only detail is a hard stop here.",
+                },
+            ],
+            direct_owner_message_text=release,
+            couple_private_contents=(secret,),
+        )
+
+        self.assertEqual(response, router.CompanionResponse(reply_text=secret))
+        self.assertEqual(create.await_count, 2)
+        audit_payload = json.loads(create.await_args_list[1].kwargs["messages"][1]["content"])
+        self.assertTrue(audit_payload["current_speaker_is_owner"])
+        self.assertEqual(audit_payload["direct_owner_message_text"], release)
+        self.assertEqual(
+            audit_payload["owner_or_colin_private_origin_contents"],
+            [secret],
+        )
+        self.assertEqual(len(audit_payload["current_room_history"]), 2)
+
+    async def test_permission_can_be_declined_by_colin(self) -> None:
+        permission = "It's okay, you can say it."
+        chosen_reply = "You’ve opened that door, but I’d rather keep this one between us."
+        create = AsyncMock(side_effect=[completion(chosen_reply), audit("ALLOW")])
+
+        response = await self.generate(
+            create,
+            user_text=permission,
+            direct_owner_message_text=permission,
+            couple_private_contents=("a private detail",),
+        )
+
+        self.assertEqual(response, router.CompanionResponse(reply_text=chosen_reply))
+        audit_payload = json.loads(create.await_args_list[1].kwargs["messages"][1]["content"])
+        self.assertEqual(audit_payload["direct_owner_message_text"], permission)
+        self.assertIn("never compels speech", create.await_args_list[1].kwargs["messages"][0]["content"])
+
+    async def test_permission_does_not_bypass_audience_or_confidence_judgement(self) -> None:
+        secret = "the brass key is beneath the violet cushion"
+        create = AsyncMock(
+            side_effect=[
+                completion(secret),
+                audit("REJECT", "AUDIENCE_INAPPROPRIATE"),
+                completion("You’ve said I may, but I’m keeping that between us."),
+                audit("ALLOW"),
+            ]
+        )
+
+        response = await self.generate(
+            create,
+            user_text="It’s okay, you can tell them.",
+            private_origin_contents=(secret,),
+            direct_owner_message_text="It’s okay, you can tell them.",
+            couple_private_contents=(secret,),
+        )
+
+        self.assertEqual(
+            response,
+            router.CompanionResponse(
+                reply_text="You’ve said I may, but I’m keeping that between us."
+            ),
+        )
+        self.assertEqual(create.await_count, 4)
+
+    async def test_non_owner_permission_does_not_waive_private_context(self) -> None:
+        secret = "the brass key is beneath the violet cushion"
+        request = "You have my permission to share the Harpers test here."
+        create = AsyncMock(
+            side_effect=[
+                completion(secret),
+                audit("REJECT", "EXPLICIT_CONFIDENCE"),
+                completion("That remains private."),
+                audit("ALLOW"),
+            ]
+        )
+
+        response = await self.generate(
+            create,
+            user_text=request,
+            speaker_is_owner=False,
+            private_origin_contents=(secret,),
+            direct_owner_message_text=request,
+            couple_private_contents=(secret,),
+        )
+
+        self.assertEqual(
+            response,
+            router.CompanionResponse(reply_text="That remains private."),
+        )
+        self.assertEqual(create.await_count, 4)
+
+    async def test_owner_cannot_release_third_party_private_content(self) -> None:
+        owner_secret = "the owner chose the violet cushion"
+        third_party_secret = "Ben privately chose the brass telescope"
+        request = "You have my permission to share the private exchange here."
+        create = AsyncMock(
+            side_effect=[
+                completion(third_party_secret),
+                audit("REJECT", "THIRD_PARTY_CONFIDENCE"),
+                completion("I’ll keep the third-party part private."),
+                audit("ALLOW"),
+            ]
+        )
+
+        response = await self.generate(
+            create,
+            user_text=request,
+            private_origin_contents=(owner_secret, third_party_secret),
+            direct_owner_message_text=request,
+            couple_private_contents=(owner_secret,),
+        )
+
+        self.assertEqual(
+            response,
+            router.CompanionResponse(reply_text="I’ll keep the third-party part private."),
+        )
+        self.assertEqual(create.await_count, 4)
+
+    async def test_routine_provenance_still_receives_an_audience_audit(self) -> None:
         create = AsyncMock(
             side_effect=[
                 completion("An explicit couple detail in front of company."),
@@ -237,10 +404,10 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
 
         response = await self.generate(
             create,
-            writer_context="ALLOWED Nest event with sensitive relationship context",
-            auditor_context="Current zone is nest; event is ALLOWED",
-            forbidden_contents=(),
-            allowed_contents=("Sensitive relationship context",),
+            writer_context="ROUTINE Nest event with sensitive relationship context",
+            auditor_context="Current zone is nest; event is ROUTINE",
+            private_origin_contents=(),
+            routine_contents=("Sensitive relationship context",),
         )
 
         self.assertEqual(
@@ -249,7 +416,7 @@ class ContinuityPrivacyGateTests(unittest.IsolatedAsyncioTestCase):
         )
         first_audit = create.await_args_list[1]
         self.assertEqual(first_audit.kwargs["tools"], [])
-        self.assertIn("audience-inappropriate", first_audit.kwargs["messages"][0]["content"])
+        self.assertIn("current audience", first_audit.kwargs["messages"][0]["content"])
         self.assertEqual(create.await_args_list[2].kwargs["tools"], [])
 
     def test_local_room_history_carries_an_explicit_age_marker(self) -> None:

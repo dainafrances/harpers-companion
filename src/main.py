@@ -475,8 +475,9 @@ def _attachment_marker(message: discord.Message) -> str:
 class ContinuityPromptInputs:
     writer_context: str | None = None
     auditor_context: str | None = None
-    allowed_contents: tuple[str, ...] = ()
-    forbidden_contents: tuple[str, ...] = ()
+    routine_contents: tuple[str, ...] = ()
+    private_origin_contents: tuple[str, ...] = ()
+    couple_private_contents: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -724,21 +725,33 @@ def _build_continuity_prompt_inputs(
     if prompt_context is None or not prompt_context.events:
         return ContinuityPromptInputs()
 
-    allowed_contents = tuple(
+    routine_contents = tuple(
         item.event.content
         for item in prompt_context.events
-        if item.disclosure is continuity.DisclosureMarker.ALLOWED
+        if item.disclosure is continuity.DisclosureMarker.ROUTINE
     )
-    forbidden_contents = tuple(
+    private_origin_contents = tuple(
         item.event.content
         for item in prompt_context.events
-        if item.disclosure is continuity.DisclosureMarker.FORBIDDEN
+        if item.disclosure is continuity.DisclosureMarker.PRIVATE_ORIGIN
+    )
+    current_speaker_is_owner = owner_id is not None and message.author.id == owner_id
+    couple_private_contents = tuple(
+        item.event.content
+        for item in prompt_context.events
+        if item.disclosure is continuity.DisclosureMarker.PRIVATE_ORIGIN
+        and current_speaker_is_owner
+        and (
+            item.event.speaker_user_id == message.author.id
+            or item.event.source == "generated-colin"
+        )
     )
     return ContinuityPromptInputs(
         writer_context=continuity.format_writer_context(prompt_context),
         auditor_context=continuity.format_auditor_context(prompt_context),
-        allowed_contents=allowed_contents,
-        forbidden_contents=forbidden_contents,
+        routine_contents=routine_contents,
+        private_origin_contents=private_origin_contents,
+        couple_private_contents=couple_private_contents,
     )
 
 
@@ -998,8 +1011,18 @@ async def handle_chat_message(
                 discord_retrieval_context=discord_retrieval_context,
                 continuity_writer_context=continuity_inputs.writer_context,
                 continuity_auditor_context=continuity_inputs.auditor_context,
-                continuity_allowed_contents=continuity_inputs.allowed_contents,
-                continuity_forbidden_contents=continuity_inputs.forbidden_contents,
+                continuity_routine_contents=continuity_inputs.routine_contents,
+                continuity_private_origin_contents=(
+                    continuity_inputs.private_origin_contents
+                ),
+                continuity_couple_private_contents=(
+                    continuity_inputs.couple_private_contents
+                ),
+                direct_owner_message_text=(
+                    cleaned_content
+                    if owner_id is not None and message.author.id == owner_id
+                    else None
+                ),
             )
 
         # String compatibility keeps older tests/extensions safe while callers
