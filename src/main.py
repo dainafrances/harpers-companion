@@ -18,6 +18,7 @@ from . import discord_recall
 from . import continuity
 from . import document_reader
 from . import elevenlabs_voice
+from .bedroom_exchange import ExchangeClient, ExchangeStopped, in_bedroom
 from . import memory
 from . import room_context
 from .router import CompanionResponse, generate_companion_reply
@@ -199,6 +200,9 @@ def _intents() -> discord.Intents:
 
 
 bot = commands.Bot(command_prefix="!", intents=_intents())
+bedroom = ExchangeClient(
+    user=lambda: bot.user, owner_id=owner_id, peer_name="Ben", log=_debug_log,
+)
 startup_synced = False
 
 
@@ -248,27 +252,48 @@ async def send_long_message(
     text: str,
     *,
     reply_to: discord.Message | None = None,
+    trigger_message: discord.Message | None = None,
+    prepared_reply=None,
 ) -> None:
+    trigger = trigger_message or reply_to
+    prepared = prepared_reply
+    if prepared is None and trigger is not None:
+        prepared = await bedroom.prepare(trigger, text)
+    if prepared is not None:
+        if not prepared.send:
+            raise ExchangeStopped("bedroom_exchange_stopped")
+        text = prepared.text
     chunks = split_for_discord(text)
+    sent_ids = []
     for index, chunk in enumerate(chunks):
         try:
+            allowed = (
+                discord.AllowedMentions(
+                    everyone=False, roles=False, replied_user=False,
+                    users=[discord.Object(id=prepared.peer_id)] if prepared.peer_id else False,
+                ) if prepared is not None else None
+            )
             if index == 0 and reply_to is not None:
-                await reply_to.reply(
+                sent = await reply_to.reply(
                     chunk,
-                    mention_author=True,
-                    allowed_mentions=_safe_allowed_mentions(replied_user=True),
+                    mention_author=prepared is None,
+                    allowed_mentions=allowed or _safe_allowed_mentions(replied_user=True),
                 )
             else:
-                await channel.send(
+                sent = await channel.send(
                     chunk,
-                    allowed_mentions=_safe_allowed_mentions(),
+                    allowed_mentions=allowed or _safe_allowed_mentions(),
                 )
+            if sent is not None:
+                sent_ids.append(sent.id)
         except discord.Forbidden:
             _debug_log("FORBIDDEN: Bot lacks permission to send messages in this channel.")
             raise
         except discord.HTTPException as e:
             _debug_log(f"HTTPException while sending message: {e}")
             raise
+    if prepared is not None:
+        await bedroom.publish(prepared, sent_ids)
 
 
 def _valid_reaction_emoji(emoji: str) -> bool:
@@ -1030,6 +1055,12 @@ async def handle_chat_message(
         if isinstance(response, str):
             response = CompanionResponse(reply_text=response)
 
+        prepared_reply = None
+        if in_bedroom(message):
+            prepared_reply = await bedroom.prepare(message, response.reply_text or "")
+            if not prepared_reply.send:
+                raise ExchangeStopped("bedroom_exchange_stopped")
+
         reaction_emojis = _response_reactions(response)
         for emoji in reaction_emojis:
             await add_optional_reaction(message, emoji)
@@ -1044,6 +1075,8 @@ async def handle_chat_message(
                 message.channel,
                 response.reply_text,
                 reply_to=message if reply_to_trigger else None,
+                trigger_message=message,
+                prepared_reply=prepared_reply,
             )
             memory.save_message(
                 channel_id=message.channel.id,
@@ -1062,6 +1095,8 @@ async def handle_chat_message(
                 f"No reply or reaction chosen for Discord message {message.id} source={source}."
             )
 
+    except ExchangeStopped:
+        _debug_log("Bedroom exchange stopped before delivery.")
     except discord.Forbidden:
         _debug_log("ERROR: Missing permissions to speak in this channel.")
     except Exception as e:
@@ -1152,6 +1187,9 @@ async def on_message(message: discord.Message) -> None:
 
     is_dm = isinstance(message.channel, discord.DMChannel)
 
+    # Only Daina in this exact room can reset its shared, durable allowance.
+    await bedroom.observe_owner(message)
+
     # DMs: always respond (subject to owner lock). A human DM resets the exchange latch.
     if is_dm:
         cleaned = (message.content or "").strip()
@@ -1216,6 +1254,18 @@ async def on_message(message: discord.Message) -> None:
 
         save_observed_message(message, source="observed-human")
         await bot.process_commands(message)
+        return
+
+    # The bedroom uses exact peer IDs and a shared budget, never the legacy latch.
+    if in_bedroom(message):
+        if await bedroom.admit(message):
+            cleaned = strip_bot_mention(message.content or "", bot.user.id) or "I'm here."
+            await handle_chat_message(
+                message, cleaned, is_dm=False, source="companion-bot",
+                reply_to_trigger=True,
+            )
+        else:
+            save_observed_message(message, source="observed-companion-bot")
         return
 
     # BOT messages: known companions may trigger by direct @mention or Discord
