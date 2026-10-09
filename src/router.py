@@ -180,7 +180,9 @@ PERIODIC_STATUS_RESPONSE_FORMAT: dict[str, Any] = {
         "strict": True,
         "schema": {
             "type": "object",
-            "properties": {"text": {"type": "string", "minLength": 0, "maxLength": 128}},
+            # Runtime validation enforces length for structured-output providers
+            # whose supported JSON Schema subset omits minLength/maxLength.
+            "properties": {"text": {"type": "string"}},
             "required": ["text"],
             "additionalProperties": False,
         },
@@ -749,7 +751,9 @@ async def _enforce_public_status_privacy(
                 raise PrivacyAuditError("Status auditor returned no choices.")
             decision = _parse_privacy_audit(choices[0].message)
             break
-        except Exception:
+        except Exception as error:
+            if source_evidence.get("automated_timer") is True:
+                _status_failure_diagnostic(stage="audit", error=error)
             continue
 
     accepted = decision is not None and decision.decision == "ALLOW"
@@ -768,6 +772,43 @@ async def _enforce_public_status_privacy(
     )
 
 
+def _status_failure_diagnostic(*, stage: str, error: Exception) -> None:
+    """Log safe error categories without exception messages, bodies, or source text."""
+    stage = stage if stage in {"selector", "parse", "audit"} else "UNKNOWN"
+    error_class = type(error).__name__
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", error_class):
+        error_class = "UNKNOWN"
+    try:
+        status = getattr(error, "status_code", None)
+    except Exception:
+        status = None
+    http_status = str(status) if type(status) is int and 100 <= status <= 599 else "UNKNOWN"
+    try:
+        code = getattr(error, "code", None)
+    except Exception:
+        code = None
+    if type(code) is int and 0 <= code <= 999999:
+        safe_code = str(code)
+    elif isinstance(code, str) and (
+        re.fullmatch(r"[0-9]{1,6}", code)
+        or code in {
+            "model_not_found", "invalid_model", "invalid_api_key", "insufficient_quota",
+            "invalid_request", "invalid_request_error", "unsupported_parameter", "unsupported_value",
+            "unsupported_response_format", "rate_limit_exceeded", "context_length_exceeded",
+            "content_filter", "provider_error", "service_unavailable", "server_error",
+            "authentication_error", "permission_denied", "not_found", "timeout",
+            "no_available_provider", "no_endpoints_found",
+        }
+    ):
+        safe_code = code
+    else:
+        safe_code = "UNKNOWN"
+    print(
+        f"[STATUS] periodic_status_error stage={stage} exception={error_class} "
+        f"http_status={http_status} api_error_code={safe_code} previous_status_retained=true"
+    )
+
+
 async def generate_periodic_discord_status(*, current_status: str = "") -> str | None:
     """Choose and audit one public status without entering the chat/memory pipeline."""
     if not _status_enabled(True) or os.getenv("DISCORD_STATUS_AUTO_ENABLED", "true").strip().lower() in {
@@ -775,6 +816,7 @@ async def generate_periodic_discord_status(*, current_status: str = "") -> str |
     }:
         return None
     model = os.getenv("MODEL_PRIMARY", DEFAULT_MODEL).strip()
+    stage = "selector"
     try:
         current_status = normalize_status_text(current_status)
         identity_style = build_system_prompt(
@@ -792,14 +834,13 @@ async def generate_periodic_discord_status(*, current_status: str = "") -> str |
                     "current_public_status": current_status,
                 }, ensure_ascii=False)},
             ],
-            temperature=0.60,
             max_tokens=_reply_token_limit(),
             reasoning_effort=_reasoning_effort(),
-            tools=[],
             response_format=PERIODIC_STATUS_RESPONSE_FORMAT,
             extra_body={"provider": {"require_parameters": True}},
             timeout=20.0,
         ), timeout=20.0)
+        stage = "parse"
         choices = getattr(selected, "choices", None)
         if not choices:
             raise ValueError("Periodic status selector returned no choices.")
@@ -807,6 +848,7 @@ async def generate_periodic_discord_status(*, current_status: str = "") -> str |
         if not isinstance(payload, dict) or set(payload) != {"text"}:
             raise ValueError("Invalid periodic status selection.")
         text = normalize_status_text(payload["text"])
+        stage = "audit"
         audited = await _enforce_public_status_privacy(
             CompanionResponse(status_text=text),
             model=model,
@@ -821,8 +863,8 @@ async def generate_periodic_discord_status(*, current_status: str = "") -> str |
             },
         )
         return audited.status_text
-    except Exception:
-        print("[STATUS] Periodic status selection failed; previous status retained.")
+    except Exception as error:
+        _status_failure_diagnostic(stage=stage, error=error)
         return None
 
 

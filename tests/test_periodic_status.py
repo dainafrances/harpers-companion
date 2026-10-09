@@ -63,8 +63,11 @@ class PeriodicStatusSelectionTests(unittest.IsolatedAsyncioTestCase):
             is_dm=False, speaker_name="Discord public profile", speaker_is_owner=False,
         )
         writer, auditor = create.await_args_list
-        self.assertEqual(writer.kwargs["tools"], [])
+        self.assertNotIn("tools", writer.kwargs)
+        self.assertNotIn("temperature", writer.kwargs)
         self.assertEqual(writer.kwargs["response_format"], router.PERIODIC_STATUS_RESPONSE_FORMAT)
+        self.assertEqual(writer.kwargs["response_format"]["json_schema"]["schema"]["properties"]["text"],
+                         {"type": "string"})
         self.assertEqual(writer.kwargs["messages"][0]["content"], "UNCHANGED IDENTITY STYLE")
         timer = json.loads(writer.kwargs["messages"][-1]["content"])
         self.assertEqual(timer, {
@@ -90,6 +93,64 @@ class PeriodicStatusSelectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_generation_errors_skip_status(self):
         self.assertIsNone((await self.choose(AsyncMock(side_effect=RuntimeError("down"))))[0])
+
+    async def test_selector_diagnostics_log_only_safe_error_metadata(self):
+        class SafeAPIError(Exception):
+            status_code = 400
+            code = "unsupported_parameter"
+            body = {"message": "PRIVATE BODY AND SOURCE WORDING"}
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            selected, _ = await self.choose(AsyncMock(side_effect=SafeAPIError("PRIVATE EXCEPTION MESSAGE")))
+        self.assertIsNone(selected)
+        diagnostic = output.getvalue()
+        self.assertIn("stage=selector", diagnostic)
+        self.assertIn("exception=SafeAPIError", diagnostic)
+        self.assertIn("http_status=400", diagnostic)
+        self.assertIn("api_error_code=unsupported_parameter", diagnostic)
+        self.assertNotIn("PRIVATE", diagnostic)
+
+    async def test_parse_diagnostics_do_not_print_model_output(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            selected, _ = await self.choose(AsyncMock(return_value=completion("PRIVATE MODEL RESPONSE")))
+        self.assertIsNone(selected)
+        self.assertIn("stage=parse", output.getvalue())
+        self.assertIn("exception=JSONDecodeError", output.getvalue())
+        self.assertNotIn("PRIVATE", output.getvalue())
+
+    async def test_unsafe_diagnostic_fields_are_suppressed(self):
+        class UnsafeAPIError(Exception):
+            status_code = "PRIVATE_HTTP_FIELD"
+            code = "PRIVATE_IDENTIFIER_WITHOUT_SPACES"
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            selected, _ = await self.choose(AsyncMock(side_effect=UnsafeAPIError("PRIVATE EXCEPTION MESSAGE")))
+        self.assertIsNone(selected)
+        self.assertIn("http_status=UNKNOWN", output.getvalue())
+        self.assertIn("api_error_code=UNKNOWN", output.getvalue())
+        self.assertNotIn("PRIVATE", output.getvalue())
+
+    async def test_audit_failure_diagnostic_preserves_skip_and_hides_private_text(self):
+        class SafeAPIError(Exception):
+            status_code = 502
+            code = "provider_error"
+
+        create = AsyncMock(side_effect=[
+            selection("PRIVATE candidate text"), SafeAPIError("PRIVATE audit error"), SafeAPIError("PRIVATE audit error"),
+        ])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            selected, _ = await self.choose(create)
+        self.assertIsNone(selected)
+        diagnostic = output.getvalue()
+        self.assertIn("stage=audit", diagnostic)
+        self.assertIn("exception=SafeAPIError", diagnostic)
+        self.assertIn("http_status=502", diagnostic)
+        self.assertIn("api_error_code=provider_error", diagnostic)
+        self.assertNotIn("PRIVATE", diagnostic)
 
     async def test_invalid_model_selection_is_skipped_without_audit(self):
         for payload in ([], {"text": 5}, {"text": "x" * 129}, {"text": "two\nlines"}, {"text": "OK", "extra": True}):
