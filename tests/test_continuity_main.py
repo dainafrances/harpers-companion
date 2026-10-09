@@ -648,9 +648,64 @@ class ContinuityMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["content"], "Colin, public now")
         self.assertEqual(rows[1]["content"], "Safe public reply")
 
+    async def test_status_update_runs_after_written_reply_and_failure_preserves_it(self) -> None:
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                message = self.message(850 + int(failure), "Choose a public status")
+                response = main.CompanionResponse(
+                    reply_text="Here's my normal reply.", status_text="Kettle on."
+                )
+
+                async def update(text):
+                    self.assertEqual(text, "Kettle on.")
+                    self.assertEqual(message.channel.sent[0][0], "Here's my normal reply.")
+                    if failure:
+                        raise RuntimeError("Gateway unavailable")
+                    return True
+
+                updater = SimpleNamespace(update=AsyncMock(side_effect=update))
+                with (
+                    patch.object(main, "generate_companion_reply", new=AsyncMock(return_value=response)),
+                    patch.object(main, "status_presence", updater),
+                ):
+                    await main.handle_chat_message(
+                        message, message.content, is_dm=False, source="human-direct"
+                    )
+                updater.update.assert_awaited_once()
+                self.assertEqual([text for text, _ in message.channel.sent], ["Here's my normal reply."])
+
+    async def test_non_owner_or_bot_cannot_publish_a_status(self) -> None:
+        for author in (FakeAuthor(99, "Someone else"), FakeAuthor(42, "Owner-ID bot", bot=True)):
+            with self.subTest(author=author.name):
+                message = self.message(860 + author.id, "Change the status", author=author)
+                response = main.CompanionResponse(reply_text="Normal reply", status_text="Forged status")
+                updater = SimpleNamespace(update=AsyncMock())
+                with (
+                    patch.object(main, "generate_companion_reply", new=AsyncMock(return_value=response)),
+                    patch.object(main, "status_presence", updater),
+                ):
+                    await main.handle_chat_message(
+                        message, message.content, is_dm=False, source="human-direct"
+                    )
+                updater.update.assert_not_awaited()
+                self.assertEqual(message.channel.sent[0][0], "Normal reply")
+
+    async def test_disabled_status_preserves_reply(self) -> None:
+        message = self.message(890, "Choose a status")
+        response = main.CompanionResponse(reply_text="Normal reply", status_text="Kettle on.")
+        with (
+            patch.object(main, "generate_companion_reply", new=AsyncMock(return_value=response)),
+            patch.object(main, "status_presence", None),
+        ):
+            await main.handle_chat_message(
+                message, message.content, is_dm=False, source="human-direct"
+            )
+        self.assertEqual(message.channel.sent[0][0], "Normal reply")
+
     async def test_failed_send_does_not_record_outbound_reply(self) -> None:
         message = self.message(505, "A message")
-        response = main.CompanionResponse(reply_text="Unsent reply")
+        response = main.CompanionResponse(reply_text="Unsent reply", status_text="Unsent status")
+        updater = SimpleNamespace(update=AsyncMock())
 
         with (
             patch.object(
@@ -663,6 +718,7 @@ class ContinuityMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "send_long_message",
                 new=AsyncMock(side_effect=RuntimeError("send failed")),
             ),
+            patch.object(main, "status_presence", updater),
         ):
             await main.handle_chat_message(
                 message,
@@ -670,6 +726,8 @@ class ContinuityMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 is_dm=False,
                 source="human-direct",
             )
+
+        updater.update.assert_not_awaited()
 
         rows = memory.get_recent_continuity_events_from_channel_before(
             guild_id="100",
