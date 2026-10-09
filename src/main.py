@@ -37,6 +37,10 @@ DISCORD_GUILD_IDS_RAW = os.getenv("DISCORD_GUILD_IDS", "").strip()
 # Backward compatibility with the old single-guild env var
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
 
+# Human messages in these guilds do not need a mention, name, or reply trigger.
+# Existing guild/channel visibility restrictions still apply.
+DISCORD_AUTO_REPLY_GUILD_IDS_RAW = os.getenv("DISCORD_AUTO_REPLY_GUILD_IDS", "").strip()
+
 MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-5.6-sol").strip()
 
 # ElevenLabs powers the optional /voice command. The API key must be supplied
@@ -158,6 +162,7 @@ if not configured_guild_ids and DISCORD_GUILD_ID and DISCORD_GUILD_ID.isdigit():
     configured_guild_ids = {int(DISCORD_GUILD_ID)}
 
 companion_channel_ids = _parse_channel_ids(COMPANION_CHANNEL_IDS_RAW)
+auto_reply_guild_ids = _parse_channel_ids(DISCORD_AUTO_REPLY_GUILD_IDS_RAW)
 recall_permissions = discord_recall.RecallPermissions(
     guild_ids=_parse_channel_ids(DISCORD_RECALL_GUILD_IDS_RAW),
     channel_ids=_parse_channel_ids(DISCORD_RECALL_CHANNEL_IDS_RAW),
@@ -1134,6 +1139,7 @@ async def on_ready() -> None:
 
     print(f"Logged in as {bot.user} using model {MODEL_PRIMARY}")
     _debug_log(f"Configured guilds: {sorted(configured_guild_ids) if configured_guild_ids else 'ALL GUILDS'}")
+    _debug_log(f"Automatic human reply guild IDs: {sorted(auto_reply_guild_ids) if auto_reply_guild_ids else 'NONE'}")
     _debug_log(
         f"Companion channel IDs: "
         f"{sorted(companion_channel_ids) if companion_channel_ids else 'ALL CHANNELS (within allowed guilds)'}"
@@ -1218,7 +1224,8 @@ async def on_message(message: discord.Message) -> None:
     # HUMAN messages
     if not message.author.bot:
         human_addressed_colin = mention_hit or everyone_hit or natural_name_hit or reply_to_self
-        if human_addressed_colin:
+        auto_reply_hit = bool(message.guild and message.guild.id in auto_reply_guild_ids)
+        if human_addressed_colin or auto_reply_hit:
             cleaned = (message.content or "").strip()
             if bot.user and mention_hit:
                 cleaned = strip_bot_mention(cleaned, bot.user.id)
@@ -1228,7 +1235,9 @@ async def on_message(message: discord.Message) -> None:
                 cleaned = "I'm here."
 
             source = (
-                "human-everyone"
+                "human-auto"
+                if not human_addressed_colin
+                else "human-everyone"
                 if everyone_hit and not mention_hit and not natural_name_hit and not reply_to_self
                 else "human-direct"
             )
