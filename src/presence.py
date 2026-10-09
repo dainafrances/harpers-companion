@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -17,6 +18,24 @@ import discord
 
 _LOGGER = logging.getLogger(__name__)
 MAX_STATUS_CHARACTERS = 128
+
+
+def status_cooldown_seconds(value: object) -> float:
+    """Keep malformed cooldown settings from disabling all later status updates."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return 300.0
+    return seconds if math.isfinite(seconds) and 20 <= seconds <= 86400 else 300.0
+
+
+def status_interval_hours(value: object) -> float:
+    """Validate configured timer hours, falling back to three hours."""
+    try:
+        hours = float(value)
+    except (TypeError, ValueError):
+        return 3.0
+    return hours if math.isfinite(hours) and 0.25 <= hours <= 8760 else 3.0
 
 
 def normalize_status_text(value: object) -> str:
@@ -48,7 +67,7 @@ class StatusPresence:
     ) -> None:
         self.bot = bot
         self.path = Path(path)
-        self.cooldown_seconds = max(20.0, float(cooldown_seconds))
+        self.cooldown_seconds = status_cooldown_seconds(cooldown_seconds)
         self._log_callback = log
         self._lock = asyncio.Lock()
         self._last_update_at: float | None = None

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import discord
 
-from src.presence import StatusPresence, normalize_status_text
+from src.presence import StatusPresence, normalize_status_text, status_cooldown_seconds
 
 
 class StatusTextTests(unittest.TestCase):
@@ -60,7 +60,20 @@ class StatusPresenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.change_presence.await_count, 2)
 
     async def test_minimum_cooldown_is_twenty_seconds(self) -> None:
-        self.assertEqual(StatusPresence(self.bot, self.path, cooldown_seconds=0).cooldown_seconds, 20)
+        self.assertEqual(StatusPresence(self.bot, self.path, cooldown_seconds=20).cooldown_seconds, 20)
+
+    async def test_invalid_cooldowns_fall_back_and_do_not_freeze_later_updates(self) -> None:
+        for value in (None, "bad", "inf", "nan", "-inf", 0, -1, 19, 86401):
+            with self.subTest(value=value):
+                self.assertEqual(status_cooldown_seconds(value), 300)
+                self.assertEqual(StatusPresence(self.bot, self.path, cooldown_seconds=value).cooldown_seconds, 300)
+        self.assertEqual(status_cooldown_seconds("86400"), 86400)
+        invalid = StatusPresence(self.bot, self.path, cooldown_seconds=float("inf"))
+        with patch("src.presence.time.monotonic", return_value=100):
+            self.assertTrue(await invalid.update("First"))
+        with patch("src.presence.time.monotonic", return_value=400):
+            self.assertTrue(await invalid.update("Later"))
+        self.assertEqual(self.bot.change_presence.await_count, 2)
 
     async def test_concurrent_updates_send_only_one_change_inside_cooldown(self) -> None:
         entered = asyncio.Event()
