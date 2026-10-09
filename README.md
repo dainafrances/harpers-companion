@@ -56,7 +56,7 @@ You will need:
 - optional: `DISCORD_AUTO_REPLY_GUILD_IDS` to answer human messages in selected servers without a mention, name, or reply trigger
 - optional: `MAX_REPLY_TOKENS` to control max model output tokens (default `2500`)
 - optional: `ENABLE_WEB_SEARCH` to turn OpenRouter web search on or off (`true` by default)
-- optional: `ENABLE_DISCORD_STATUS`, `DISCORD_STATUS_COOLDOWN_SECONDS`, and `DISCORD_STATUS_PATH` to configure the custom-status bubble
+- optional: `ENABLE_DISCORD_STATUS`, `DISCORD_STATUS_AUTO_ENABLED`, `DISCORD_STATUS_COOLDOWN_SECONDS`, `DISCORD_STATUS_INTERVAL_HOURS`, and `DISCORD_STATUS_PATH` to configure the custom-status bubble
 - optional: `MAX_DOCUMENT_BYTES` and `MAX_DOCUMENT_CHARS` to cap document processing
 - optional: `DISCORD_RECALL_GUILD_IDS` and `DISCORD_RECALL_CHANNEL_IDS` to explicitly opt guilds/channels into the recall index
 - optional: `DISCORD_CONTINUITY_GUILD_ZONES`, `DISCORD_CONTINUITY_CHANNEL_ROUTES`, `DISCORD_CONTINUITY_HANDOFF_LIMIT`, `DISCORD_CONTINUITY_HANDOFF_MAX_AGE_MINUTES`, and `DISCORD_CONTINUITY_AWARENESS_PER_GUILD_LIMIT` to enable Colin-only cross-server awareness and handoffs
@@ -119,8 +119,21 @@ people and companion bots cannot trigger this tool.
 
 `ENABLE_DISCORD_STATUS` defaults to `true`; an owner ID must be configured. Text is
 limited to 128 characters on one line. Updates skip duplicate text and observe a
-five-minute cooldown (`DISCORD_STATUS_COOLDOWN_SECONDS=300`, minimum 20 seconds).
+five-minute cooldown (`DISCORD_STATUS_COOLDOWN_SECONDS=300`). Configured cooldowns
+must be finite and from 20 to 86400 seconds; invalid values fall back to 300.
 Proposals made during the cooldown are skipped; they do not queue for later.
+
+Colin also chooses a fresh public status automatically every three hours
+(`DISCORD_STATUS_INTERVAL_HOURS=3`). The background task starts once after Discord
+is ready; it fills an empty status initially, while a restored status waits until
+the first scheduled interval. Reconnects do not start extra tasks. The model uses
+his existing identity for style and the current public status, with no room
+transcripts, journals, or memory retrieval. Each selection still receives the
+public-audience check. This task posts no chat messages and writes no memories or
+journals. Failed selection, audit, or Discord updates keep the previous status.
+The interval accepts finite hours from 0.25 to 8760; invalid values fall back to
+three. Set `DISCORD_STATUS_AUTO_ENABLED=false` to stop automatic refresh while
+keeping the conversation tool available.
 
 The last successfully sent status is stored in `data/discord_status.json`, separate
 from the memory database. Mount `data/` on persistent storage to keep it through
@@ -131,7 +144,7 @@ To check it live, talk with Colin from the configured owner's Discord account an
 ask him to choose a short public status. Open his profile and check the thought
 bubble beside his avatar. Confirm that he also sent his usual written reply.
 Then ask him to change it after the cooldown. Set `ENABLE_DISCORD_STATUS=false`
-to disable the tool and saved-status restoration.
+to disable the tool, automatic refresh, and saved-status restoration.
 
 ## ElevenLabs voice recordings
 

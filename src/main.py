@@ -23,7 +23,7 @@ from .bedroom_exchange import ExchangeClient, ExchangeStopped, in_bedroom
 from . import memory
 from . import presence
 from . import room_context
-from .router import CompanionResponse, generate_companion_reply
+from .router import CompanionResponse, generate_companion_reply, generate_periodic_discord_status
 
 load_dotenv()
 
@@ -47,12 +47,15 @@ MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-5.6-sol").strip()
 DISCORD_STATUS_ENABLED = os.getenv("ENABLE_DISCORD_STATUS", "true").strip().lower() not in {
     "0", "false", "no",
 }
-try:
-    DISCORD_STATUS_COOLDOWN_SECONDS = max(
-        20.0, float(os.getenv("DISCORD_STATUS_COOLDOWN_SECONDS", "300"))
-    )
-except ValueError:
-    DISCORD_STATUS_COOLDOWN_SECONDS = 300.0
+DISCORD_STATUS_AUTO_ENABLED = os.getenv("DISCORD_STATUS_AUTO_ENABLED", "true").strip().lower() not in {
+    "0", "false", "no",
+}
+DISCORD_STATUS_COOLDOWN_SECONDS = presence.status_cooldown_seconds(
+    os.getenv("DISCORD_STATUS_COOLDOWN_SECONDS", "300")
+)
+DISCORD_STATUS_INTERVAL_HOURS = presence.status_interval_hours(
+    os.getenv("DISCORD_STATUS_INTERVAL_HOURS", "3")
+)
 
 # ElevenLabs powers the optional /voice command. The API key must be supplied
 # as a deployment secret; the voice ID is safe to keep as a configurable default.
@@ -215,7 +218,15 @@ def _intents() -> discord.Intents:
     return intents
 
 
-bot = commands.Bot(command_prefix="!", intents=_intents())
+class CompanionBot(commands.Bot):
+    async def close(self) -> None:
+        timer = globals().get("periodic_status_refresh")
+        if timer is not None:
+            timer.cancel()
+        await super().close()
+
+
+bot = CompanionBot(command_prefix="!", intents=_intents())
 status_presence = (
     presence.StatusPresence(
         bot,
@@ -230,6 +241,7 @@ bedroom = ExchangeClient(
     user=lambda: bot.user, owner_id=owner_id, peer_name="Ben", log=_debug_log,
 )
 startup_synced = False
+status_refresh_started = False
 
 
 # ----------------------------
@@ -1173,6 +1185,13 @@ async def on_ready() -> None:
 
     if not nightly_journal.is_running():
         nightly_journal.start()
+    if (
+        DISCORD_STATUS_ENABLED
+        and DISCORD_STATUS_AUTO_ENABLED
+        and status_presence is not None
+        and not periodic_status_refresh.is_running()
+    ):
+        periodic_status_refresh.start()
 
     print(f"Logged in as {bot.user} using model {MODEL_PRIMARY}")
     _debug_log(f"Configured guilds: {sorted(configured_guild_ids) if configured_guild_ids else 'ALL GUILDS'}")
@@ -1222,7 +1241,9 @@ async def on_ready() -> None:
     _debug_log(f"Bot reply cooldown seconds: {BOT_REPLY_COOLDOWN_SECONDS}")
     _debug_log(
         f"Discord profile status: {'enabled' if status_presence is not None else 'disabled'}; "
-        f"cooldown_seconds={DISCORD_STATUS_COOLDOWN_SECONDS}."
+        f"automatic_refresh={'enabled' if DISCORD_STATUS_AUTO_ENABLED else 'disabled'}; "
+        f"cooldown_seconds={DISCORD_STATUS_COOLDOWN_SECONDS}; "
+        f"refresh_interval_hours={DISCORD_STATUS_INTERVAL_HOURS}."
     )
 
 
@@ -1398,6 +1419,41 @@ async def on_message(message: discord.Message) -> None:
 # ----------------------------
 # Heartbeat
 # ----------------------------
+@tasks.loop(hours=DISCORD_STATUS_INTERVAL_HOURS)
+async def periodic_status_refresh() -> None:
+    """Refresh the public profile silently, apart from all chat and memory work."""
+    global status_refresh_started
+    if (
+        not DISCORD_STATUS_ENABLED
+        or not DISCORD_STATUS_AUTO_ENABLED
+        or status_presence is None
+        or bot.is_closed()
+    ):
+        periodic_status_refresh.cancel()
+        return
+    if not bot.is_ready():
+        return
+    if not status_refresh_started:
+        status_refresh_started = True
+        # Preserve a restored status until the first scheduled interval.
+        if status_presence.current_text:
+            return
+    try:
+        selected = await asyncio.wait_for(
+            generate_periodic_discord_status(current_status=status_presence.current_text),
+            timeout=35.0,
+        )
+        if selected is not None and bot.is_ready() and not bot.is_closed():
+            await asyncio.wait_for(status_presence.update(selected), timeout=5.0)
+    except Exception:
+        _debug_log("Periodic Discord status refresh failed; previous status retained.")
+
+
+@periodic_status_refresh.before_loop
+async def before_periodic_status_refresh() -> None:
+    await bot.wait_until_ready()
+
+
 @tasks.loop(hours=24)
 async def nightly_journal() -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")

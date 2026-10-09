@@ -159,6 +159,35 @@ Return only the required ALLOW/REJECT JSON object. Never provide a rewrite or ex
 """.strip()
 
 
+PERIODIC_STATUS_REQUEST = """
+This is an automated public-profile status refresh, not a human message or conversation turn.
+Use your existing identity for your own voice and style only. Choose your own brief Discord
+custom status, public across all shared servers. There is no current room, audience permission,
+private conversation, journal, or memory supplied for this task. Do not reveal private details
+from the identity context. Do not invent real-world travel, locations, completed tasks, or news
+as current facts. If choosing an imagined Cottage moment, make its Cottage setting clear.
+Ordinary moods, intentions, or public-safe Cottage imagery are suitable. You may keep the
+current public status if you prefer. Your words are your choice, not a preset rotation.
+Return only the required JSON object with a single text field of at most 128 characters on
+one line. An empty string clears the status. Do not write a chat reply, call tools, address a
+human speaker, or claim anything has already been sent to Discord.
+""".strip()
+
+PERIODIC_STATUS_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "public_discord_status_text",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string", "minLength": 0, "maxLength": 128}},
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
 class PrivacyAuditError(RuntimeError):
     """The privacy auditor did not return a trustworthy decision."""
 
@@ -737,6 +766,64 @@ async def _enforce_public_status_privacy(
         reply_text=response.reply_text,
         reaction_emojis=response.reaction_emojis,
     )
+
+
+async def generate_periodic_discord_status(*, current_status: str = "") -> str | None:
+    """Choose and audit one public status without entering the chat/memory pipeline."""
+    if not _status_enabled(True) or os.getenv("DISCORD_STATUS_AUTO_ENABLED", "true").strip().lower() in {
+        "0", "false", "no",
+    }:
+        return None
+    model = os.getenv("MODEL_PRIMARY", DEFAULT_MODEL).strip()
+    try:
+        current_status = normalize_status_text(current_status)
+        identity_style = build_system_prompt(
+            is_dm=False,
+            speaker_name="Discord public profile",
+            speaker_is_owner=False,
+        )
+        selected = await asyncio.wait_for(_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": identity_style},
+                {"role": "system", "content": PERIODIC_STATUS_REQUEST},
+                {"role": "user", "content": json.dumps({
+                    "task": "automated_public_status_selection",
+                    "current_public_status": current_status,
+                }, ensure_ascii=False)},
+            ],
+            temperature=0.60,
+            max_tokens=_reply_token_limit(),
+            reasoning_effort=_reasoning_effort(),
+            tools=[],
+            response_format=PERIODIC_STATUS_RESPONSE_FORMAT,
+            extra_body={"provider": {"require_parameters": True}},
+            timeout=20.0,
+        ), timeout=20.0)
+        choices = getattr(selected, "choices", None)
+        if not choices:
+            raise ValueError("Periodic status selector returned no choices.")
+        payload = json.loads(choices[0].message.content)
+        if not isinstance(payload, dict) or set(payload) != {"text"}:
+            raise ValueError("Invalid periodic status selection.")
+        text = normalize_status_text(payload["text"])
+        audited = await _enforce_public_status_privacy(
+            CompanionResponse(status_text=text),
+            model=model,
+            source_evidence={
+                "automated_timer": True,
+                "identity_style_source": identity_style,
+                "current_public_status": current_status,
+                "current_room_history": [],
+                "current_user_message": "",
+                "direct_owner_message_text": "",
+                "current_speaker_is_owner": False,
+            },
+        )
+        return audited.status_text
+    except Exception:
+        print("[STATUS] Periodic status selection failed; previous status retained.")
+        return None
 
 
 def _messages_with_privacy_correction(
