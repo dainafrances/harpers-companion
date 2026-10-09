@@ -6,6 +6,7 @@ A minimal Discord bot starter for a private, text-first Colin build.
 
 - replies in DMs
 - replies when mentioned in a server
+- can answer every human message in explicitly configured home servers
 - stores simple memory in SQLite
 - observes permitted channel conversation without replying to every visible message
 - can optionally index approved Discord channels for receipts-based recall
@@ -51,6 +52,7 @@ You will need:
 - optional: `PRIVACY_AUDIT_MODEL` to use a separate model for the tool-free disclosure check (defaults to `MODEL_PRIMARY`)
 - optional: `REASONING_EFFORT` to control thinking depth (`high` by default; valid values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`)
 - optional: `BOT_REPLY_COOLDOWN_SECONDS` to limit how often Colin replies to bot-origin messages in a channel
+- optional: `DISCORD_AUTO_REPLY_GUILD_IDS` to answer human messages in selected servers without a mention, name, or reply trigger
 - optional: `MAX_REPLY_TOKENS` to control max model output tokens (default `2500`)
 - optional: `ENABLE_WEB_SEARCH` to turn OpenRouter web search on or off (`true` by default)
 - optional: `MAX_DOCUMENT_BYTES` and `MAX_DOCUMENT_CHARS` to cap document processing
@@ -58,6 +60,20 @@ You will need:
 - optional: `DISCORD_CONTINUITY_GUILD_ZONES`, `DISCORD_CONTINUITY_CHANNEL_ROUTES`, `DISCORD_CONTINUITY_HANDOFF_LIMIT`, `DISCORD_CONTINUITY_HANDOFF_MAX_AGE_MINUTES`, and `DISCORD_CONTINUITY_AWARENESS_PER_GUILD_LIMIT` to enable Colin-only cross-server awareness and handoffs
 - optional: `ROOM_CONTEXT_GUILD_LABELS` and `ROOM_CONTEXT_CHANNEL_LABELS` to label rooms with trusted modes/names
 - optional: `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL_ID`, and `VOICE_MAX_CHARS` to override the `/voice` defaults
+
+## Automatic replies in a home server
+
+Set `DISCORD_AUTO_REPLY_GUILD_IDS` to the home server's numeric Discord ID to
+answer human messages there without an `@mention`, one of Colin's names, or a
+reply to his previous message. Multiple IDs can be separated by commas. Leave
+the setting blank to keep the usual trigger rules everywhere.
+
+This setting applies within the existing `DISCORD_GUILD_IDS` and
+`COMPANION_CHANNEL_IDS` restrictions, including threads whose channel IDs are
+allowed. It does not grant channel access. Human text and attachment-only messages
+use the normal reply path and message-ID deduplication; bot messages retain their
+existing triggers and loop limits. An automatic human message resets the companion
+exchange just as an addressed human message does.
 
 ## Bot `@everyone` questions
 

@@ -110,6 +110,16 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         main.bot_reply_cooldown_by_channel.clear()
         self.bot_patch = patch.object(main, "bot", self.fake_bot)
         self.bot_patch.start()
+        # Keep routing expectations independent of local deployment settings.
+        for attribute, value in (
+            ("auto_reply_guild_ids", set()),
+            ("configured_guild_ids", set()),
+            ("companion_channel_ids", set()),
+            ("SPONTANEOUS_REPLY_CHANCE", 0.0),
+        ):
+            routing_patch = patch.object(main, attribute, value)
+            routing_patch.start()
+            self.addCleanup(routing_patch.stop)
 
     def tearDown(self) -> None:
         self.bot_patch.stop()
@@ -128,6 +138,157 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("guild_name: Nest Guild", self.saved_messages()[0]["content"])
         self.assertIn("channel_name: the-nest", self.saved_messages()[0]["content"])
         self.assertIn("Room context", self.saved_messages()[0]["content"])
+
+    async def test_auto_reply_guild_answers_unaddressed_human_without_random_chance(self) -> None:
+        message = FakeMessage(40, self.other_human, "  How was your day?  ", channel=self.channel)
+        with (
+            patch.object(main, "auto_reply_guild_ids", {message.guild.id}),
+            patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
+        ):
+            await main.on_message(message)
+
+        handler.assert_awaited_once_with(
+            message,
+            "How was your day?",
+            is_dm=False,
+            source="human-auto",
+            reset_companion_exchange=True,
+        )
+        self.fake_bot.process_commands.assert_not_awaited()
+        self.assertEqual(self.saved_messages(), [])
+
+    async def test_auto_reply_guild_does_not_enable_another_guild(self) -> None:
+        message = FakeMessage(41, self.human, "Ordinary conversation", channel=self.channel)
+        with (
+            patch.object(main, "auto_reply_guild_ids", {message.guild.id + 1}),
+            patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
+        ):
+            await main.on_message(message)
+
+        handler.assert_not_awaited()
+        self.assertIn("Ordinary conversation", self.saved_messages()[0]["content"])
+        self.fake_bot.process_commands.assert_awaited_once_with(message)
+
+    async def test_auto_reply_still_obeys_configured_guild_allowlist(self) -> None:
+        message = FakeMessage(42, self.human, "Outside allowed guilds", channel=self.channel)
+        with (
+            patch.object(main, "auto_reply_guild_ids", {message.guild.id}),
+            patch.object(main, "configured_guild_ids", {message.guild.id + 1}),
+            patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
+        ):
+            await main.on_message(message)
+
+        handler.assert_not_awaited()
+        self.assertEqual(self.saved_messages(), [])
+        self.fake_bot.process_commands.assert_awaited_once_with(message)
+
+    async def test_auto_reply_still_obeys_companion_channel_allowlist(self) -> None:
+        message = FakeMessage(43, self.human, "Outside allowed channels", channel=self.channel)
+        with (
+            patch.object(main, "auto_reply_guild_ids", {message.guild.id}),
+            patch.object(main, "companion_channel_ids", {self.channel.id + 1}),
+            patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
+        ):
+            await main.on_message(message)
+
+        handler.assert_not_awaited()
+        self.assertEqual(self.saved_messages(), [])
+        self.fake_bot.process_commands.assert_awaited_once_with(message)
+
+    async def test_auto_reply_guild_keeps_unaddressed_bot_observation_only(self) -> None:
+        message = FakeMessage(44, self.ben, "Just talking to the room", channel=self.channel)
+        with (
+            patch.object(main, "auto_reply_guild_ids", {message.guild.id}),
+            patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
+        ):
+            await main.on_message(message)
+
+        handler.assert_not_awaited()
+        self.assertIn("Just talking to the room", self.saved_messages()[0]["content"])
+
+    async def test_auto_reply_guild_ignores_own_messages(self) -> None:
+        message = FakeMessage(45, self.colin, "My own answer", channel=self.channel)
+        with (
+            patch.object(main, "auto_reply_guild_ids", {message.guild.id}),
+            patch.object(main, "handle_chat_message", new=AsyncMock()) as handler,
+        ):
+            await main.on_message(message)
+
+        handler.assert_not_awaited()
+        self.assertEqual(self.saved_messages(), [])
+        self.fake_bot.process_commands.assert_not_awaited()
+
+    async def test_auto_reply_guild_preserves_explicit_trigger_sources(self) -> None:
+        messages = (
+            (
+                FakeMessage(46, self.human, "<@1> hello", channel=self.channel, mentions=[self.colin]),
+                "hello",
+                "human-direct",
+            ),
+            (
+                FakeMessage(47, self.human, "Colin, hello", channel=self.channel),
+                "Colin, hello",
+                "human-direct",
+            ),
+            (
+                FakeMessage(48, self.human, "replying", channel=self.channel, reply_to=self.colin),
+                "replying",
+                "human-direct",
+            ),
+            (
+                FakeMessage(49, self.human, "@everyone hello", channel=self.channel, mention_everyone=True),
+                "hello",
+                "human-everyone",
+            ),
+        )
+        with patch.object(main, "auto_reply_guild_ids", {700}):
+            for message, cleaned, source in messages:
+                with self.subTest(source=source, content=message.content):
+                    with patch.object(main, "handle_chat_message", new=AsyncMock()) as handler:
+                        await main.on_message(message)
+                    handler.assert_awaited_once_with(
+                        message,
+                        cleaned,
+                        is_dm=False,
+                        source=source,
+                        reset_companion_exchange=True,
+                    )
+
+    async def test_duplicate_auto_reply_message_generates_and_resets_once(self) -> None:
+        message = FakeMessage(50, self.human, "A fresh conversation", channel=self.channel)
+        main.bot_to_bot_cooldowns.add(self.ben.id)
+        with (
+            patch.object(main, "auto_reply_guild_ids", {message.guild.id}),
+            patch.object(main, "generate_companion_reply", new=AsyncMock(return_value="Hello back")) as generate,
+            patch.object(main, "_reset_companion_exchange", wraps=main._reset_companion_exchange) as reset,
+        ):
+            await main.on_message(message)
+            await main.on_message(message)
+
+        generate.assert_awaited_once()
+        reset.assert_called_once_with(channel_id=self.channel.id, message_id=message.id)
+        self.assertNotIn(self.ben.id, main.bot_to_bot_cooldowns)
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertEqual(sum(item["role"] == "user" for item in self.saved_messages()), 1)
+
+    async def test_auto_reply_guild_attachment_only_message_reaches_generation(self) -> None:
+        attachment = SimpleNamespace(
+            content_type="image/png",
+            filename="picture.png",
+            url="https://example.test/picture.png",
+        )
+        message = FakeMessage(51, self.human, "", channel=self.channel, attachments=[attachment])
+        with (
+            patch.object(main, "auto_reply_guild_ids", {message.guild.id}),
+            patch.object(main, "generate_companion_reply", new=AsyncMock(return_value="I can see it.")) as generate,
+        ):
+            await main.on_message(message)
+
+        generate.assert_awaited_once()
+        self.assertEqual(generate.await_args.kwargs["image_urls"], [attachment.url])
+        self.assertEqual(self.channel.sent[0][0], "I can see it.")
+        inbound = next(item for item in self.saved_messages() if item["role"] == "user")
+        self.assertIn("[ATTACHMENTS: 1 image(s)/gif(s)]", inbound["content"])
 
     async def test_normal_reply_path_passes_actual_owner_speaker_metadata(self) -> None:
         message = FakeMessage(21, self.human, "Hello", channel=self.channel)
