@@ -8,6 +8,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -20,6 +21,7 @@ from . import document_reader
 from . import elevenlabs_voice
 from .bedroom_exchange import ExchangeClient, ExchangeStopped, in_bedroom
 from . import memory
+from . import presence
 from . import room_context
 from .router import CompanionResponse, generate_companion_reply
 
@@ -42,6 +44,15 @@ DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()
 DISCORD_AUTO_REPLY_GUILD_IDS_RAW = os.getenv("DISCORD_AUTO_REPLY_GUILD_IDS", "").strip()
 
 MODEL_PRIMARY = os.getenv("MODEL_PRIMARY", "openai/gpt-5.6-sol").strip()
+DISCORD_STATUS_ENABLED = os.getenv("ENABLE_DISCORD_STATUS", "true").strip().lower() not in {
+    "0", "false", "no",
+}
+try:
+    DISCORD_STATUS_COOLDOWN_SECONDS = max(
+        20.0, float(os.getenv("DISCORD_STATUS_COOLDOWN_SECONDS", "300"))
+    )
+except ValueError:
+    DISCORD_STATUS_COOLDOWN_SECONDS = 300.0
 
 # ElevenLabs powers the optional /voice command. The API key must be supplied
 # as a deployment secret; the voice ID is safe to keep as a configurable default.
@@ -205,6 +216,16 @@ def _intents() -> discord.Intents:
 
 
 bot = commands.Bot(command_prefix="!", intents=_intents())
+status_presence = (
+    presence.StatusPresence(
+        bot,
+        path=Path(os.getenv("DISCORD_STATUS_PATH", "data/discord_status.json")),
+        cooldown_seconds=DISCORD_STATUS_COOLDOWN_SECONDS,
+        log=_debug_log,
+    )
+    if DISCORD_STATUS_ENABLED and owner_id is not None
+    else None
+)
 bedroom = ExchangeClient(
     user=lambda: bot.user, owner_id=owner_id, peer_name="Ben", log=_debug_log,
 )
@@ -1095,10 +1116,26 @@ async def handle_chat_message(
                     message,
                     content=response.reply_text,
                 )
-        elif not reaction_emojis:
+        elif not reaction_emojis and getattr(response, "status_text", None) is None:
             _debug_log(
                 f"No reply or reaction chosen for Discord message {message.id} source={source}."
             )
+
+        # Publish only after the normal reply has been delivered. A status failure
+        # must never replace text or turn a successful conversation into an error.
+        status_text = getattr(response, "status_text", None)
+        if (
+            status_text is not None
+            and response.reply_text
+            and status_presence is not None
+            and owner_id is not None
+            and message.author.id == owner_id
+            and not message.author.bot
+        ):
+            try:
+                await asyncio.wait_for(status_presence.update(status_text), timeout=5.0)
+            except Exception:
+                _debug_log("Discord profile status update failed; written reply preserved.")
 
     except ExchangeStopped:
         _debug_log("Bedroom exchange stopped before delivery.")
@@ -1183,6 +1220,10 @@ async def on_ready() -> None:
     _debug_log(f"Self aliases: {sorted(self_name_aliases)}")
     _debug_log(f"Spontaneous chance: {SPONTANEOUS_REPLY_CHANCE}")
     _debug_log(f"Bot reply cooldown seconds: {BOT_REPLY_COOLDOWN_SECONDS}")
+    _debug_log(
+        f"Discord profile status: {'enabled' if status_presence is not None else 'disabled'}; "
+        f"cooldown_seconds={DISCORD_STATUS_COOLDOWN_SECONDS}."
+    )
 
 
 @bot.event

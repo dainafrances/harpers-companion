@@ -21,6 +21,7 @@ A minimal Discord bot starter for a private, text-first Colin build.
 - includes slash commands for `/ping`, `/status`, `/journal_now`, and `/voice`
 - uses OpenRouter as the model transport through the OpenAI-compatible client
 - reads supported document attachments and can search the web with source links
+- can choose and update his Discord custom-status bubble during conversations with the owner
 
 ## Folder layout
 
@@ -55,6 +56,7 @@ You will need:
 - optional: `DISCORD_AUTO_REPLY_GUILD_IDS` to answer human messages in selected servers without a mention, name, or reply trigger
 - optional: `MAX_REPLY_TOKENS` to control max model output tokens (default `2500`)
 - optional: `ENABLE_WEB_SEARCH` to turn OpenRouter web search on or off (`true` by default)
+- optional: `ENABLE_DISCORD_STATUS`, `DISCORD_STATUS_COOLDOWN_SECONDS`, and `DISCORD_STATUS_PATH` to configure the custom-status bubble
 - optional: `MAX_DOCUMENT_BYTES` and `MAX_DOCUMENT_CHARS` to cap document processing
 - optional: `DISCORD_RECALL_GUILD_IDS` and `DISCORD_RECALL_CHANNEL_IDS` to explicitly opt guilds/channels into the recall index
 - optional: `DISCORD_CONTINUITY_GUILD_ZONES`, `DISCORD_CONTINUITY_CHANNEL_ROUTES`, `DISCORD_CONTINUITY_HANDOFF_LIMIT`, `DISCORD_CONTINUITY_HANDOFF_MAX_AGE_MINUTES`, and `DISCORD_CONTINUITY_AWARENESS_PER_GUILD_LIMIT` to enable Colin-only cross-server awareness and handoffs
@@ -102,6 +104,34 @@ size limit are not processed. Image attachments continue to use the existing vis
 Web research uses OpenRouter's `openrouter:web_search` server tool. It is enabled by
 default, and Colin can include source links in his reply. Set `ENABLE_WEB_SEARCH=false`
 to disable it for a deployment.
+
+## Colin's custom-status bubble
+
+Colin has an optional `set_discord_status` model tool during conversations with
+the configured owner (`BOT_OWNER_DISCORD_ID`). He chooses whether to use it and
+what to write; it is not a rotating list of preset messages. Normal written replies
+and reactions continue independently. An empty status clears the bubble.
+
+Custom status is public across the bot's servers. Every proposed nonempty status
+receives a separate public-audience confidentiality check, even in DMs. A rejected
+status or failed check leaves the written reply and previous status intact. Other
+people and companion bots cannot trigger this tool.
+
+`ENABLE_DISCORD_STATUS` defaults to `true`; an owner ID must be configured. Text is
+limited to 128 characters on one line. Updates skip duplicate text and observe a
+five-minute cooldown (`DISCORD_STATUS_COOLDOWN_SECONDS=300`, minimum 20 seconds).
+Proposals made during the cooldown are skipped; they do not queue for later.
+
+The last successfully sent status is stored in `data/discord_status.json`, separate
+from the memory database. Mount `data/` on persistent storage to keep it through
+redeploys. It is loaded into the initial Discord connection, including fresh
+reconnections, without sending a presence update from `on_ready()`.
+
+To check it live, talk with Colin from the configured owner's Discord account and
+ask him to choose a short public status. Open his profile and check the thought
+bubble beside his avatar. Confirm that he also sent his usual written reply.
+Then ask him to change it after the cooldown. Set `ENABLE_DISCORD_STATUS=false`
+to disable the tool and saved-status restoration.
 
 ## ElevenLabs voice recordings
 
