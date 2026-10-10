@@ -334,6 +334,15 @@ async def send_long_message(
         await bedroom.publish(prepared, sent_ids)
 
 
+async def post_painted_image(channel: discord.abc.Messageable, posted) -> None:
+    """Post an image the companion chose to share, with its own caption."""
+    await channel.send(
+        content=posted.caption or None,
+        file=discord.File(io.BytesIO(posted.data), filename=posted.filename),
+        allowed_mentions=_safe_allowed_mentions(),
+    )
+
+
 def _valid_reaction_emoji(emoji: str) -> bool:
     """Apply conservative bounds; Discord performs final Unicode validation."""
     return bool(
@@ -1086,6 +1095,8 @@ async def handle_chat_message(
                     if owner_id is not None and message.author.id == owner_id
                     else None
                 ),
+                # Painting is for people, not bot-to-bot exchanges (keeps cost loops out).
+                paint_allowed=not message.author.bot and not in_bedroom(message),
             )
 
         # String compatibility keeps older tests/extensions safe while callers
@@ -1128,7 +1139,26 @@ async def handle_chat_message(
                     message,
                     content=response.reply_text,
                 )
-        elif not reaction_emojis and getattr(response, "status_text", None) is None:
+
+        posted_images = tuple(getattr(response, "images", ()) or ())
+        for posted in posted_images:
+            await post_painted_image(message.channel, posted)
+            memory.save_message(
+                channel_id=message.channel.id,
+                user_id=bot.user.id if bot.user else 0,
+                role="assistant",
+                content=(
+                    f"[IMAGE POSTED] {posted.caption}" if posted.caption else "[IMAGE POSTED]"
+                ),
+                source=source,
+            )
+
+        if (
+            not response.reply_text
+            and not posted_images
+            and not reaction_emojis
+            and getattr(response, "status_text", None) is None
+        ):
             _debug_log(
                 f"No reply or reaction chosen for Discord message {message.id} source={source}."
             )
