@@ -9,6 +9,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from . import paintbox
 from .discord_recall import RECALL_POLICY
 from .identity import build_memory_note, build_system_prompt
 from .presence import normalize_status_text
@@ -207,6 +208,7 @@ class CompanionResponse:
     reply_text: str | None
     reaction_emojis: tuple[str, ...]
     status_text: str | None
+    images: tuple[paintbox.PostedImage, ...]
 
     def __init__(
         self,
@@ -215,12 +217,14 @@ class CompanionResponse:
         *,
         reaction_emoji: str | None = None,
         status_text: str | None = None,
+        images: tuple[paintbox.PostedImage, ...] = (),
     ) -> None:
         combined = list(reaction_emojis)
         if reaction_emoji and reaction_emoji not in combined:
             combined.insert(0, reaction_emoji)
         object.__setattr__(self, "reply_text", reply_text)
         object.__setattr__(self, "status_text", status_text)
+        object.__setattr__(self, "images", tuple(images))
         object.__setattr__(
             self,
             "reaction_emojis",
@@ -327,10 +331,14 @@ def _status_enabled(speaker_is_owner: bool) -> bool:
     }
 
 
-def _available_tools(*, status_enabled: bool = False) -> list[dict[str, Any]]:
+def _available_tools(
+    *, status_enabled: bool = False, paint_enabled: bool = False,
+) -> list[dict[str, Any]]:
     tools = [*_web_search_tool(), _reaction_tool()]
     if status_enabled:
         tools.append(_status_tool())
+    if paint_enabled:
+        tools.append(paintbox.create_tool())
     return tools
 
 
@@ -380,14 +388,23 @@ def _requested_reactions(tool_calls: Any) -> tuple[str, ...]:
     return tuple(requested)
 
 
-def _tool_follow_up_messages(message: Any, *, status_enabled: bool = False) -> list[dict[str, Any]]:
+def _tool_follow_up_messages(
+    message: Any,
+    *,
+    status_enabled: bool = False,
+    paint_results: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """Acknowledge local proposals so the model can finish its written reply."""
     local_calls = []
     tool_results = []
+    paint_index = 0
     for index, tool_call in enumerate(getattr(message, "tool_calls", None) or []):
         function = getattr(tool_call, "function", None)
         name = getattr(function, "name", None)
-        if name not in {"react_to_message", "set_discord_status"}:
+        handled = {"react_to_message", "set_discord_status"}
+        if paint_results is not None:
+            handled.add(paintbox.CREATE_TOOL_NAME)
+        if name not in handled:
             continue
         call_id = getattr(tool_call, "id", None) or f"local-call-{index}"
         local_calls.append({
@@ -398,7 +415,13 @@ def _tool_follow_up_messages(message: Any, *, status_enabled: bool = False) -> l
                 "arguments": getattr(function, "arguments", "{}"),
             },
         })
-        if name == "set_discord_status":
+        if name == paintbox.CREATE_TOOL_NAME:
+            paint_call_id = getattr(tool_call, "id", None) or f"paint-call-{paint_index}"
+            paint_index += 1
+            result = (paint_results or {}).get(
+                paint_call_id, "No image made. Now provide your normal written reply.",
+            )
+        elif name == "set_discord_status":
             result = (
                 "Status proposal recorded for a public-profile confidentiality check and runtime "
                 "cooldown. It has not been applied yet. Now provide your normal written reply."
@@ -645,8 +668,16 @@ async def _generate_writer_candidate(
     tools: list[dict[str, Any]] | None = None,
     follow_up_tools: list[dict[str, Any]] | None = None,
     status_enabled: bool = False,
+    paint_enabled: bool = False,
 ) -> CompanionResponse:
-    selected_tools = _available_tools(status_enabled=status_enabled) if tools is None else tools
+    selected_tools = (
+        _available_tools(status_enabled=status_enabled, paint_enabled=paint_enabled)
+        if tools is None else tools
+    )
+    paint_offered = any(
+        tool.get("function", {}).get("name") == paintbox.CREATE_TOOL_NAME
+        for tool in selected_tools
+    )
     response = await _client.chat.completions.create(
         model=model,
         messages=messages,
@@ -660,15 +691,35 @@ async def _generate_writer_candidate(
     first_message = message
     reaction_emojis = _requested_reactions(getattr(message, "tool_calls", None))
     status_text = _requested_status(getattr(message, "tool_calls", None), enabled=status_enabled)
-    follow_up_messages = _tool_follow_up_messages(message, status_enabled=status_enabled)
+
+    # Paintbox: make any requested images, then show them privately to the
+    # companion before it decides whether to post them.
+    paint_results: dict[str, str] | None = None
+    painted: dict[str, paintbox.GeneratedImage] = {}
+    if paint_offered:
+        create_calls = paintbox.create_calls(getattr(message, "tool_calls", None))
+        if create_calls:
+            paint_results, painted = await paintbox.run_create_calls(_client, create_calls)
+
+    follow_up_messages = _tool_follow_up_messages(
+        message, status_enabled=status_enabled, paint_results=paint_results,
+    )
+    preview = paintbox.preview_message(painted)
+    if preview is not None:
+        follow_up_messages.append(preview)
+    posted: tuple[paintbox.PostedImage, ...] = ()
     if follow_up_messages and selected_tools:
         continuation_tools = (
             _web_search_tool() if follow_up_tools is None else follow_up_tools
         )
         continuation_tools = [
             tool for tool in continuation_tools
-            if tool.get("function", {}).get("name") not in {"react_to_message", "set_discord_status"}
+            if tool.get("function", {}).get("name") not in {
+                "react_to_message", "set_discord_status", paintbox.CREATE_TOOL_NAME,
+            }
         ]
+        if painted:
+            continuation_tools.append(paintbox.post_tool())
         try:
             response = await _client.chat.completions.create(
                 model=model,
@@ -679,6 +730,7 @@ async def _generate_writer_candidate(
                 tools=continuation_tools,
             )
             message = response.choices[0].message
+            posted = paintbox.requested_posts(getattr(message, "tool_calls", None), painted)
         except Exception:
             if not (first_message.content or "").strip():
                 raise
@@ -694,6 +746,7 @@ async def _generate_writer_candidate(
         reply_text=text.strip() or None,
         reaction_emojis=reaction_emojis,
         status_text=status_text,
+        images=posted,
     )
 
 
@@ -769,6 +822,7 @@ async def _enforce_public_status_privacy(
     return CompanionResponse(
         reply_text=response.reply_text,
         reaction_emojis=response.reaction_emojis,
+        images=response.images,
     )
 
 
@@ -1006,9 +1060,14 @@ async def generate_companion_reply(
     continuity_routine_contents: tuple[str, ...] = (),
     continuity_couple_private_contents: tuple[str, ...] = (),
     direct_owner_message_text: str | None = None,
+    paint_allowed: bool = False,
 ) -> CompanionResponse:
     model = os.getenv("MODEL_PRIMARY", DEFAULT_MODEL).strip()
     status_enabled = _status_enabled(speaker_is_owner)
+    # Cross-room awareness turns keep their restricted tool set; no painting there.
+    paint_enabled = (
+        paint_allowed and paintbox.paintbox_enabled() and not continuity_auditor_context
+    )
 
     messages: list[dict[str, Any]] = [
         {
@@ -1082,6 +1141,7 @@ async def generate_companion_reply(
         ),
         follow_up_tools=[] if continuity_auditor_context else None,
         status_enabled=status_enabled,
+        paint_enabled=paint_enabled,
     )
 
     # Current-room speech is routine comparison evidence. It prevents material
