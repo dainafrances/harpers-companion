@@ -1142,7 +1142,11 @@ async def handle_chat_message(
 
         posted_images = tuple(getattr(response, "images", ()) or ())
         for posted in posted_images:
-            await post_painted_image(message.channel, posted)
+            try:
+                await post_painted_image(message.channel, posted)
+            except Exception as error:
+                _debug_log(f"Paintbox upload failed type={type(error).__name__}; written reply preserved.")
+                continue
             memory.save_message(
                 channel_id=message.channel.id,
                 user_id=bot.user.id if bot.user else 0,
