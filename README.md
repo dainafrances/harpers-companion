@@ -380,6 +380,49 @@ python -m src.main
 
 6. Deploy.
 
+## SFW image generation
+
+Paintbox uses `create_image`, a private model preview, and an optional
+`post_image` choice. Only images selected for posting are sent to the current
+Discord channel. Bot-to-bot and bedroom exchanges do not offer painting.
+
+For the paid Riverflow backend, explicitly configure:
+
+```env
+PAINTBOX_ENABLED=true
+PAINTBOX_SFW_MODEL=sourceful/riverflow-v2.5-fast
+PAINTBOX_DAILY_CAP=30
+PAINTBOX_GENERATION_TIMEOUT_SECONDS=180
+PAINTBOX_USAGE_PATH=/app/data/paintbox-usage.sqlite
+```
+
+The exact paid model uses OpenRouter's dedicated Images API at 1K resolution,
+with one JPEG per request. Other configured models retain chat-completion
+compatibility. The repository defaults remain disabled and do not opt a
+deployment into paid generation. Supply the existing `OPENROUTER_API_KEY`
+through deployment secrets.
+
+The daily cap resets at midnight UTC. With an explicit usage path on the
+persistent volume, it survives restarts and redeploys. Each provider attempt,
+including a failed attempt, reserves one slot before the request. A configured
+counter that cannot be read or written blocks generation. Without an explicit
+path, the counter is process-local. The generation timeout is bounded to
+60–300 seconds; malformed or non-finite settings use 180 seconds.
+
+The image selector uses only the current-room conversation. Imported room
+awareness, retrieved transcripts, and journal context stay outside that step.
+Where a continuity privacy gate is active, prompts are checked before provider
+requests and selected images/captions are checked before delivery.
+
+`python scripts/check_paintbox.py` performs one fixed SFW provider check without
+posting or saving its image. It requires the paid model, an explicit absolute
+usage path, and a different absolute `PAINTBOX_CHECK_MARKER` path. The marker is
+claimed before generation to prevent repeated paid checks after restarts. The
+check shares the ordinary daily cap and logs only a fixed result category,
+numeric error codes, MIME type, and byte count. For a temporary Railway launch,
+`python -u scripts/check_paintbox.py --start-bot` starts the normal bot while the
+independent check runs; restore `python -m src.main` afterward.
+
 ## Notes
 
 - This is a first skeleton, not the final architecture.
