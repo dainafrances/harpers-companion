@@ -117,6 +117,10 @@ class StartupHarness:
             (main, "becoming_callbacks", None),
             (main, "startup_synced", False),
             (main, "becoming_synced", False),
+            (main, "becoming_backup_manager", None),
+            (main, "becoming_backup_scheduler", None),
+            (main, "becoming_backup_callbacks", None),
+            (main, "becoming_backup_synced", False),
             (main, "DISCORD_STATUS_ENABLED", True),
             (main, "DISCORD_STATUS_AUTO_ENABLED", True),
             (main, "status_presence", SimpleNamespace()),
@@ -457,7 +461,8 @@ class BecomingStartupTests(unittest.IsolatedAsyncioTestCase):
                     path = Path(temp) / "room.sqlite3"
                     env = dict(os.environ, DISCORD_TOKEN="test-token", OPENROUTER_API_KEY="test-key",
                                BECOMING_ENABLED=enabled, BOT_OWNER_DISCORD_ID=owner, BECOMING_CHANNEL_ID="456",
-                               BECOMING_GUILD_ID="789", BECOMING_DB_PATH=str(path))
+                               BECOMING_GUILD_ID="789", BECOMING_DB_PATH=str(path),
+                               BECOMING_BACKUP_REQUIRED_FOR_ROOM="false", BECOMING_BACKUP_ENABLED="false")
                     code = (
                         "import json;import src.main as m;"
                         "print(json.dumps({'service':m.becoming_service is not None,"
@@ -470,10 +475,107 @@ class BecomingStartupTests(unittest.IsolatedAsyncioTestCase):
                         "service": expected_service, "exists": False, "callbacks": True, "rooms": [],
                     })
 
+    def test_required_missing_backup_prevents_store_construction_before_import(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "room.sqlite3"
+            env = {key: value for key, value in os.environ.items() if not key.startswith("BECOMING_BACKUP_")}
+            env.update(DISCORD_TOKEN="test-token", OPENROUTER_API_KEY="test-key", BECOMING_ENABLED="true",
+                       BOT_OWNER_DISCORD_ID="123", BECOMING_CHANNEL_ID="456", BECOMING_GUILD_ID="789",
+                       BECOMING_DB_PATH=str(path))
+            code = (
+                "import json;from unittest.mock import patch;import src.becoming as b;"
+                "guard=patch.object(b,'RoomStore',side_effect=AssertionError('store construction denied'));"
+                "guard.start();import src.main as m;"
+                "print(json.dumps({'service':m.becoming_service is not None,'valid':m.becoming_config.valid,"
+                "'exists':m.becoming_config.db_path.exists(),'backup':m.becoming_backup_manager is not None}))"
+            )
+            child = subprocess.run([sys.executable, "-B", "-c", code], env=env, text=True,
+                                   capture_output=True, check=True)
+            self.assertEqual(json.loads(child.stdout.splitlines()[-1]), {
+                "service": False, "valid": False, "exists": False, "backup": False,
+            })
+
+    def test_backup_constructor_failure_preserves_ordinary_import_and_required_room_gate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            env = dict(os.environ, DISCORD_TOKEN="test-token", OPENROUTER_API_KEY="test-key",
+                       BECOMING_ENABLED="true", BOT_OWNER_DISCORD_ID="123", BECOMING_CHANNEL_ID="456",
+                       BECOMING_GUILD_ID="789", BECOMING_DB_PATH=str(Path(temp) / "room.sqlite3"))
+            code = (
+                "import json;from unittest.mock import patch;from types import SimpleNamespace;"
+                "import src.becoming_backup as b;"
+                "c=SimpleNamespace(can_run=True,required_for_room=True,room_allowed=lambda room: True);"
+                "patch.object(b.BackupConfig,'from_env',return_value=c).start();"
+                "patch.object(b,'BackupManager',side_effect=RuntimeError('PRIVATE ERROR')).start();"
+                "import src.main as m;print(json.dumps({'service':m.becoming_service is not None,"
+                "'valid':m.becoming_config.valid,'exists':m.becoming_config.db_path.exists(),"
+                "'commands':sorted(c.name for c in m.bot.tree.get_commands())}))"
+            )
+            child = subprocess.run([sys.executable, "-B", "-c", code], env=env, text=True,
+                                   capture_output=True, check=True)
+            self.assertEqual(json.loads(child.stdout.splitlines()[-1]), {
+                "service": False, "valid": False, "exists": False, "commands": sorted(LEGACY_NAMES),
+            })
+            self.assertNotIn("PRIVATE ERROR", child.stdout + child.stderr)
+
+    async def test_backup_sync_failure_preserves_four_room_commands_and_timers(self):
+        async with StartupHarness() as harness:
+            manager = SimpleNamespace(config=SimpleNamespace(can_run=True), active=False,
+                                      run=AsyncMock(), status=Mock(return_value={}))
+            scheduler = SimpleNamespace(start=Mock())
+            with patch.object(main, "becoming_backup_manager", manager), patch.object(
+                main, "becoming_backup_scheduler", scheduler,
+            ):
+                harness.room_fail_name = "becoming_backup_now"
+                harness.room_failures = 1
+                await harness.ready()
+                self.assertTrue(main.startup_synced and main.becoming_synced)
+                self.assertFalse(main.becoming_backup_synced)
+                self.assertIsNotNone(main.becoming_backup_callbacks)
+                self.assertTrue(ROOM_NAMES <= set(harness.remote_global))
+                self.assertEqual([payload["name"] for _, payload in harness.upserts[:4]],
+                                 ["becoming_want", "becoming_show", "becoming_revise", "becoming_history"])
+                await harness.ready()
+                self.assertTrue(main.becoming_backup_synced)
+                self.assertEqual(set(harness.remote_global) & {
+                    "becoming_backup_now", "becoming_backup_status",
+                }, {"becoming_backup_now", "becoming_backup_status"})
+                scheduler.start.assert_called()
+                harness.assert_timers_once(self)
+                harness.assert_primary_payloads(self)
+                manager.run.assert_not_awaited()
+                self.assertNotIn("PRIVATE ERROR", " ".join(harness.logs))
+
+    async def test_scheduler_starts_even_when_optional_room_publication_fails(self):
+        async with StartupHarness() as harness:
+            harness.room_failures = 1
+            scheduler = SimpleNamespace(start=Mock(side_effect=lambda: harness.events.append(("backup_start",))))
+            manager = SimpleNamespace(config=SimpleNamespace(can_run=True))
+            with patch.object(main, "becoming_backup_manager", manager), patch.object(
+                main, "becoming_backup_scheduler", scheduler,
+            ):
+                await harness.ready()
+                self.assertFalse(main.becoming_synced)
+                self.assertFalse(main.becoming_backup_synced)
+                scheduler.start.assert_called_once_with()
+                self.assertLess(harness.events.index(("timer_start", "journal")),
+                                harness.events.index(("backup_start",)))
+                self.assertLess(harness.events.index(("timer_start", "status")),
+                                harness.events.index(("backup_start",)))
+
+    async def test_backup_scheduler_failure_cannot_interrupt_existing_startup(self):
+        async with StartupHarness() as harness:
+            scheduler = SimpleNamespace(start=Mock(side_effect=RuntimeError("PRIVATE BACKUP ERROR")))
+            with patch.object(main, "becoming_backup_scheduler", scheduler):
+                await harness.ready()
+                self.assertTrue(main.startup_synced and main.becoming_synced)
+                harness.assert_timers_once(self)
+                self.assertNotIn("PRIVATE BACKUP ERROR", " ".join(harness.logs))
+
     def test_invalid_room_path_disables_feature_without_crashing_import(self):
         env = dict(os.environ, DISCORD_TOKEN="test-token", OPENROUTER_API_KEY="test-key",
                    BECOMING_ENABLED="true", BOT_OWNER_DISCORD_ID="123", BECOMING_CHANNEL_ID="456",
-                   BECOMING_GUILD_ID="789", BECOMING_DB_PATH="~room_becoming_missing_user/room.sqlite3")
+                   BECOMING_GUILD_ID="789", BECOMING_DB_PATH="~room_becoming_missing_user/room.sqlite3",
+                   BECOMING_BACKUP_REQUIRED_FOR_ROOM="false", BECOMING_BACKUP_ENABLED="false")
         code = (
             "import json;import src.main as m;"
             "print(json.dumps({'service':m.becoming_service is not None,'valid':m.becoming_config.valid,"

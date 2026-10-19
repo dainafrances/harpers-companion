@@ -23,7 +23,7 @@ from .bedroom_exchange import ExchangeClient, ExchangeStopped, in_bedroom
 from . import memory
 from . import presence
 from . import room_context
-from . import becoming, becoming_commands
+from . import becoming, becoming_commands, becoming_backup, becoming_backup_discord
 from .router import (
     CompanionResponse, generate_companion_reply, generate_periodic_discord_status,
     generate_becoming_want,
@@ -227,6 +227,9 @@ class CompanionBot(commands.Bot):
         timer = globals().get("periodic_status_refresh")
         if timer is not None:
             timer.cancel()
+        backup_scheduler = globals().get("becoming_backup_scheduler")
+        if backup_scheduler is not None:
+            await backup_scheduler.close()
         await super().close()
 
 
@@ -234,6 +237,10 @@ bot = CompanionBot(command_prefix="!", intents=_intents())
 # Room configuration is inert. Commands are registered only after ordinary
 # startup succeeds and existing background jobs have started.
 becoming_config = becoming.RoomConfig.from_env()
+becoming_backup_config = becoming_backup.BackupConfig.from_env(room_config=becoming_config)
+if becoming_config.enabled and becoming_config.valid and not becoming_backup_config.room_allowed(becoming_config):
+    becoming_config = replace(becoming_config, valid=False)
+    _debug_log("Room backup requirement unavailable; private Room access denied.")
 becoming_service = None
 if becoming_config.enabled and becoming_config.valid:
     try:
@@ -246,6 +253,25 @@ if becoming_config.enabled and becoming_config.valid:
         becoming_config = replace(becoming_config, valid=False)
         _debug_log("Room of Becoming configuration unavailable; access denied.")
 becoming_callbacks = None
+becoming_backup_manager = None
+becoming_backup_scheduler = None
+if becoming_service is not None and becoming_backup_config.can_run:
+    try:
+        becoming_backup_manager = becoming_backup.BackupManager(
+            becoming_backup_config, becoming_service.store,
+        )
+        becoming_backup_scheduler = becoming_backup_discord.BackupScheduler(
+            bot, room_config=becoming_config, manager=becoming_backup_manager,
+        )
+    except Exception:
+        becoming_backup_manager = None
+        becoming_backup_scheduler = None
+        if becoming_backup_config.required_for_room:
+            becoming_config = replace(becoming_config, valid=False)
+            becoming_service = None
+        _debug_log("Room backup operations unavailable; existing bot startup preserved.")
+becoming_backup_callbacks = None
+becoming_backup_synced = False
 status_presence = (
     presence.StatusPresence(
         bot,
@@ -1220,6 +1246,7 @@ async def handle_chat_message(
 # ----------------------------
 async def _start_commands_and_jobs() -> None:
     global startup_synced, becoming_synced, becoming_callbacks
+    global becoming_backup_callbacks, becoming_backup_synced
     memory.init_db()
 
     if not startup_synced:
@@ -1248,6 +1275,12 @@ async def _start_commands_and_jobs() -> None:
     ):
         periodic_status_refresh.start()
 
+    if becoming_backup_scheduler is not None:
+        try:
+            becoming_backup_scheduler.start()
+        except Exception:
+            _debug_log("Room backup scheduler unavailable; existing bot jobs preserved.")
+
     if (
         startup_synced
         and becoming_config.enabled
@@ -1268,6 +1301,23 @@ async def _start_commands_and_jobs() -> None:
             # Optional Room publication cannot prevent existing jobs starting.
             # Flags and cached definitions permit an idempotent ready retry.
             _debug_log("Room command registration unavailable; existing bot jobs preserved.")
+
+    if (
+        startup_synced and becoming_synced and becoming_backup_manager is not None
+        and becoming_config.enabled and becoming_config.valid and not becoming_backup_synced
+    ):
+        try:
+            if becoming_backup_callbacks is None:
+                becoming_backup_callbacks = becoming_backup_discord.register_commands(
+                    bot, config=becoming_config, manager=becoming_backup_manager,
+                )
+            if becoming_backup_callbacks is not None:
+                await becoming_backup_discord.sync_commands(
+                    bot, becoming_backup_callbacks, guild_id=becoming_config.guild_id,
+                )
+                becoming_backup_synced = True
+        except Exception:
+            _debug_log("Room backup command registration unavailable; existing bot jobs preserved.")
 
 
 @bot.event
