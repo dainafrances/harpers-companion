@@ -22,6 +22,7 @@ A minimal Discord bot starter for a private, text-first Colin build.
 - uses OpenRouter as the model transport through the OpenAI-compatible client
 - reads supported document attachments and can search the web with source links
 - can choose and update his Discord custom-status bubble during conversations with the owner
+- includes an optional private Room of Becoming with explicit commands and preserved revision history
 
 ## Folder layout
 
@@ -62,6 +63,92 @@ You will need:
 - optional: `DISCORD_CONTINUITY_GUILD_ZONES`, `DISCORD_CONTINUITY_CHANNEL_ROUTES`, `DISCORD_CONTINUITY_HANDOFF_LIMIT`, `DISCORD_CONTINUITY_HANDOFF_MAX_AGE_MINUTES`, and `DISCORD_CONTINUITY_AWARENESS_PER_GUILD_LIMIT` to enable Colin-only cross-server awareness and handoffs
 - optional: `ROOM_CONTEXT_GUILD_LABELS` and `ROOM_CONTEXT_CHANNEL_LABELS` to label rooms with trusted modes/names
 - optional: `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL_ID`, and `VOICE_MAX_CHARS` to override the `/voice` defaults
+
+## The Room of Becoming (Phase 1)
+
+The Room is a private, durable workspace for entries created during explicit model
+invocations. Phase 1 supports `want` entries: create one, retrieve it, revise it
+without replacing earlier wording, and inspect its history after a restart. It is
+disabled by default and has not been deployed as part of this implementation.
+
+The canonical contract and acceptance criteria are in
+[ROOM_OF_BECOMING_V1.md](docs/room-of-becoming/ROOM_OF_BECOMING_V1.md).
+
+To configure the Room in a private local test environment:
+
+```text
+BECOMING_ENABLED=true
+BOT_OWNER_DISCORD_ID=123456789012345678
+BECOMING_CHANNEL_ID=234567890123456789
+BECOMING_GUILD_ID=
+BECOMING_DB_PATH=/private/tmp/room-of-becoming-local-UNIQUE/room.sqlite3
+```
+
+Replace the example IDs with the owner's exact user ID and the exact approved
+channel ID. A blank `BECOMING_GUILD_ID` permits only that owner's one-to-one DM
+with the bot, in the configured channel; group DMs are not approved. For a guild
+route, set its exact guild ID as well. IDs must be valid positive Discord IDs.
+Missing or invalid privacy configuration denies Room access. Guild responses are
+ephemeral, and Room responses disable mentions. Owner and route authorization are
+checked independently by every Room command.
+
+For this local check, replace `UNIQUE` with a fresh private directory name and use
+an isolated checkout, disposable data directory and test Discord application.
+Keep the test bot token separate from production. The example temporary path is
+deliberate: do not point local verification at the production database or use the
+default persistent database path for a disposable check. The normal default,
+when the feature is intentionally configured for durable use, is
+`data/room_of_becoming.sqlite3`.
+
+Commands:
+
+- `/becoming_want [seed]` makes one real model request to create a want or abstain.
+- `/becoming_show entry_id` retrieves the current content, status, revision and provenance.
+- `/becoming_revise entry_id expected_revision instruction` makes a new request and appends a revision or records abstention. A stale revision number is rejected.
+- `/becoming_history entry_id` retrieves all revisions in order, with authorship and revision reasons.
+
+An abstention records a receipt and creates no entry. Duplicate delivery of the
+same operation does not create another entry or automatically repeat a paid
+request. An interrupted pending invocation remains incomplete; it does not prove
+that no provider request happened. There are no automatic Room entries, scheduled
+Room requests, annotation/status-change/delete commands, or memory-promotion path
+in Phase 1. The first real want will use the seed supplied privately in the
+implementation packet; no real seed or entry content is
+included in source, fixtures, migrations, or Git.
+
+The Room uses its own SQLite database, with an application marker and explicit
+schema version. Keep its path separate from the ordinary memory and Paintbox
+databases. Room content does not feed ordinary chat history, journals, recall,
+continuity, status, images, identity construction, or canonical memory. Creation
+uses the existing identity bundle and the explicit seed; revision adds only the
+stored revision being revised and the explicit instruction. Private prompt text
+and chain-of-thought are not stored as provenance.
+
+Long entries and complete histories use private page controls without truncating
+stored content. The controls expire after 14 minutes; rerun `/becoming_show` or
+`/becoming_history` to open a fresh view. Expiry does not remove any records.
+
+Manual verification, after the local implementation has been reviewed:
+
+1. Start only the isolated test application with the temporary Room path and exact private test route above. This connects to Discord; create/revise commands make real provider requests and may incur provider charges.
+2. From the configured owner's account, run `/becoming_want` with clearly labelled disposable test context. Confirm a created receipt and entry ID, or an honest abstention with no entry.
+3. For a created entry, run `/becoming_show`, then `/becoming_revise` with `expected_revision=1`, then `/becoming_history`. Confirm the original text is intact and the new text appears as revision 2 with its reason.
+4. Stop and restart that same isolated test application with the same temporary database path. Retrieve the entry and history again. Try a stale expected revision and denied user/route; confirm no extra entry or successful revision is claimed.
+
+These steps have not been run against production. Do not initialize or inspect a
+production Room database, change production variables, or deploy to Railway as
+part of local verification. The Room tests use temporary databases and mocked
+provider requests; passing those tests is separate from this manual Discord test.
+
+For durability, place the configured database on a persistent private volume.
+A persistent volume is not a backup. Before deployment, arrange restricted file
+permissions and an operator-managed backup/restore process. Use SQLite's backup
+API or stop writers and use a consistent database snapshot; copying a live main
+file alone can omit committed WAL data. Restore only into a stopped isolated
+instance, verify the application marker, schema version and revision history,
+and confirm the configured path before resuming writes. Protect backups and
+exports as private Room content. Never commit runtime entries, credentials,
+database files, SQLite sidecars, or private exports to this public repository.
 
 ## Automatic replies in a home server
 

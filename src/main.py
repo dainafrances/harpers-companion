@@ -6,7 +6,7 @@ import os
 import random
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,7 +23,11 @@ from .bedroom_exchange import ExchangeClient, ExchangeStopped, in_bedroom
 from . import memory
 from . import presence
 from . import room_context
-from .router import CompanionResponse, generate_companion_reply, generate_periodic_discord_status
+from . import becoming, becoming_commands
+from .router import (
+    CompanionResponse, generate_companion_reply, generate_periodic_discord_status,
+    generate_becoming_want,
+)
 
 load_dotenv()
 
@@ -227,6 +231,23 @@ class CompanionBot(commands.Bot):
 
 
 bot = CompanionBot(command_prefix="!", intents=_intents())
+# Room registration is inert: only independently authorized explicit commands
+# can initialize or access its dedicated store. Nothing enters the chat pipeline.
+becoming_config = becoming.RoomConfig.from_env()
+becoming_service = None
+if becoming_config.enabled and becoming_config.valid:
+    try:
+        becoming_service = becoming.RoomService(
+            becoming.RoomStore(becoming_config.db_path, protected_paths=(memory.DB_PATH,)),
+            generate_becoming_want,
+            MODEL_PRIMARY,
+        )
+    except becoming.RoomError:
+        becoming_config = replace(becoming_config, valid=False)
+        _debug_log("Room of Becoming configuration unavailable; access denied.")
+becoming_callbacks = becoming_commands.register_commands(
+    bot, config=becoming_config, service=becoming_service,
+)
 status_presence = (
     presence.StatusPresence(
         bot,
@@ -241,6 +262,7 @@ bedroom = ExchangeClient(
     user=lambda: bot.user, owner_id=owner_id, peer_name="Ben", log=_debug_log,
 )
 startup_synced = False
+becoming_synced = False
 status_refresh_started = False
 
 
@@ -1200,7 +1222,7 @@ async def handle_chat_message(
 # ----------------------------
 @bot.event
 async def on_ready() -> None:
-    global startup_synced
+    global startup_synced, becoming_synced
     memory.init_db()
 
     if not startup_synced:
@@ -1216,6 +1238,27 @@ async def on_ready() -> None:
                 print(f"Synced {len(synced)} global command(s).")
         finally:
             startup_synced = True
+
+    if becoming_config.enabled and becoming_config.valid and not becoming_synced:
+        try:
+            if becoming_config.guild_id is None and configured_guild_ids:
+                # Publish Room globals without widening legacy guild commands.
+                await becoming_commands.sync_dm_commands(bot, becoming_callbacks)
+            elif (
+                becoming_config.guild_id is not None
+                and int(becoming_config.guild_id) not in configured_guild_ids
+                and configured_guild_ids
+            ):
+                # The explicit Room route does not grant ordinary chat access.
+                room_guild = discord.Object(id=int(becoming_config.guild_id))
+                for command in becoming_callbacks.commands:
+                    bot.tree.add_command(command, guild=room_guild, override=True)
+                await bot.tree.sync(guild=room_guild)
+            becoming_synced = True
+        except Exception:
+            # Optional Room registration cannot prevent existing background
+            # jobs from starting. A later ready event may retry registration.
+            _debug_log("Room command registration unavailable; existing bot jobs preserved.")
 
     if not nightly_journal.is_running():
         nightly_journal.start()

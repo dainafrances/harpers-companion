@@ -2,5 +2,14 @@ __pycache__/
 *.pyc
 .venv/
 .env
-data/*.sqlite3
+# Private runtime databases, including SQLite journals, WAL and shared-memory files.
+data/*.sqlite*
+data/*.db
+data/*.db-*
+data/*.db.*
 data/discord_status.json
+# Private Room exports are runtime data, never repository documentation.
+data/becoming-exports/
+data/becoming_exports/
+data/room-of-becoming-exports/
+data/room_of_becoming_exports/
