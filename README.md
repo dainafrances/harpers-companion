@@ -98,7 +98,34 @@ Keep the test bot token separate from production. The example temporary path is
 deliberate: do not point local verification at the production database or use the
 default persistent database path for a disposable check. The normal default,
 when the feature is intentionally configured for durable use, is
-`data/room_of_becoming.sqlite3`.
+`data/room-of-becoming/room_of_becoming.sqlite3`.
+
+Every accepted in-repository Room database must remain inside the dedicated
+ignored `data/room-of-becoming/` directory. Nested and extensionless database
+names inside that directory are protected with their SQLite sidecars. Other
+in-repository paths are rejected, including repository-root files and other
+subdirectories, even when a filename happens to match an ignore rule. Traversal
+and symlink escapes are rejected before SQLite or a provider request. Genuine
+external paths remain configurable after application-database, symlink,
+hardlink and sidecar collision checks. The runtime does not invoke Git to decide
+whether a path is safe.
+
+The previous default, `data/room_of_becoming.sqlite3`, is now rejected when
+configured explicitly. The new default does not discover or relocate an old
+database. Before enabling an existing installation, an operator must confirm its
+database location and use a consistent backup and an explicitly authorized
+relocation to the protected directory or a valid external path. These repairs
+perform no data migration.
+
+The Room's optional commands are absent from the initial ordinary command sync.
+Disabled or invalid Room configuration adds no Room definitions or Room sync.
+Ordinary command startup and the existing journal/status timers run independently
+before separately guarded Room registration and synchronization. Enabled Room
+commands register idempotently; a Room-only failure is bounded and may be retried
+on reconnect without starting duplicate timers or discarding ordinary commands.
+Guild configuration syncs Room commands to its exact guild without publishing
+them globally. DM configuration uses a separate global sync that preserves
+already-working ordinary global commands.
 
 Commands:
 
@@ -117,7 +144,10 @@ implementation packet; no real seed or entry content is
 included in source, fixtures, migrations, or Git.
 
 The Room uses its own SQLite database, with an application marker and explicit
-schema version. Keep its path separate from the ordinary memory and Paintbox
+schema version. Integrity checks verify required table, index and trigger
+definitions, not merely their names; unexpected objects or altered definitions
+are rejected without repairing, migrating or overwriting the database. Keep its
+path separate from the ordinary memory and Paintbox
 databases. Room content does not feed ordinary chat history, journals, recall,
 continuity, status, images, identity construction, or canonical memory. Creation
 uses the existing identity bundle and the explicit seed; revision adds only the
@@ -128,7 +158,17 @@ Long entries and complete histories use private page controls without truncating
 stored content. The controls expire after 14 minutes; rerun `/becoming_show` or
 `/becoming_history` to open a fresh view. Expiry does not remove any records.
 
-Manual verification, after the local implementation has been reviewed:
+Synthetic local verification uses actual `discord.py` command objects and the
+provider SDK with deterministic in-memory HTTP transports when isolated,
+explicitly non-production credentials are unavailable. It must use invented
+content and a disposable database, then clean up its artifacts. These mocks
+exercise the request/receipt path; live Discord/provider network behavior is
+**NOT VERIFIED** by that test. SDK failures retain only bounded, allowlisted
+model/provider/response identifiers from known structured fields, never raw
+bodies, error messages or private prompts.
+
+Manual network verification, only with explicitly non-production credentials
+after the local implementation has been reviewed:
 
 1. Start only the isolated test application with the temporary Room path and exact private test route above. This connects to Discord; create/revise commands make real provider requests and may incur provider charges.
 2. From the configured owner's account, run `/becoming_want` with clearly labelled disposable test context. Confirm a created receipt and entry ID, or an honest abstention with no entry.
@@ -149,6 +189,11 @@ instance, verify the application marker, schema version and revision history,
 and confirm the configured path before resuming writes. Protect backups and
 exports as private Room content. Never commit runtime entries, credentials,
 database files, SQLite sidecars, or private exports to this public repository.
+
+The inherited shared owner-ID parser issue is recorded as
+[RB-OWN-001](docs/room-of-becoming/BACKLOG.md). It is deferred from these Room
+repairs; malformed owner configuration must never become absent-owner or
+unrestricted access.
 
 ## Automatic replies in a home server
 

@@ -6,12 +6,15 @@ identity, retrieval, or Discord integrations. Only explicit Room commands use it
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 from uuid import uuid4
@@ -20,6 +23,10 @@ SCHEMA_VERSION = 1
 APPLICATION_ID = 0x52423031  # RB01: a separate database, not a legacy schema extension.
 PROMPT_VERSION = "room-of-becoming-v1"
 UNKNOWN = "UNKNOWN"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+PRIVATE_STORAGE_DIRECTORY = Path("data/room-of-becoming")
+DEFAULT_DB_PATH = PRIVATE_STORAGE_DIRECTORY / "room_of_becoming.sqlite3"
+_SQLITE_SIDECARS = ("-journal", "-wal", "-shm")
 ERROR_CATEGORIES = frozenset({
     "storage_failure", "database_collision", "schema_mismatch", "invalid_input",
     "not_found", "stale_revision", "operation_conflict", "operation_incomplete",
@@ -93,7 +100,7 @@ class RoomConfig:
         channel = _discord_id(env.get("BECOMING_CHANNEL_ID"))
         guild_raw = env.get("BECOMING_GUILD_ID", "").strip()
         guild = _discord_id(guild_raw) if guild_raw else None
-        path_raw = env.get("BECOMING_DB_PATH", "data/room_of_becoming.sqlite3").strip()
+        path_raw = env.get("BECOMING_DB_PATH", str(DEFAULT_DB_PATH)).strip()
         enabled = env.get("BECOMING_ENABLED", "false").strip().lower() == "true"
         valid = bool(owner and channel and path_raw and (not guild_raw or guild))
         return cls(enabled, owner, channel, guild, Path(path_raw), valid)
@@ -191,10 +198,54 @@ _SCHEMA = (
 )
 
 
+def _normalized_schema_sql(statement: str | None) -> str | None:
+    """Normalize formatting without changing quoted SQL literals or identifiers."""
+    if statement is None:
+        return None
+    tokens = re.findall(
+        r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\]|\s+|[^\s'\"`\[]+",
+        statement,
+    )
+    return "".join(" " if token.isspace() else token for token in tokens).strip()
+
+
+def _schema_fingerprint(conn: sqlite3.Connection) -> str:
+    # ANALYZE can add these SQLite-owned statistics tables. Include autoindexes:
+    # their names/table associations are part of the required unique constraints.
+    statistics = {"sqlite_stat1", "sqlite_stat2", "sqlite_stat3", "sqlite_stat4"}
+    objects = []
+    for kind, name, table, sql in conn.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name,tbl_name"
+    ):
+        if kind == "table" and name in statistics:
+            continue
+        objects.append((kind, name, table, _normalized_schema_sql(sql)))
+    return hashlib.sha256(json.dumps(objects, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+@lru_cache(maxsize=1)
+def _expected_schema_fingerprint() -> str:
+    # Build the reference from the original v1 definitions without touching disk.
+    conn = sqlite3.connect(":memory:")
+    try:
+        for statement in _SCHEMA:
+            conn.execute(statement)
+        return _schema_fingerprint(conn)
+    finally:
+        conn.close()
+
+
 class RoomStore:
     def __init__(self, path: str | Path, *, protected_paths: tuple[str | Path, ...] = ()):
         try:
-            self.path = Path(path).expanduser().resolve()
+            configured_path = Path(path).expanduser()
+            if ".." in configured_path.parts:
+                raise RoomError("invalid_input")
+            # Keep the lexical location as well as its target: resolving an
+            # in-repository symlink first must not turn an escape into an allowed
+            # external path. Relative configuration keeps its existing CWD basis.
+            self._configured_path = configured_path.absolute()
+            self.path = self._configured_path.resolve()
         except (OSError, RuntimeError, TypeError, ValueError):
             raise RoomError("invalid_input") from None
         self.protected_paths = (
@@ -208,13 +259,26 @@ class RoomStore:
 
     def _validate_path(self) -> None:
         try:
+            root = REPOSITORY_ROOT.resolve()
+            private = root / PRIVATE_STORAGE_DIRECTORY
+            if self._configured_path.resolve() != self.path:
+                raise RoomError("invalid_input")
+            own_paths = (self.path, *(Path(str(self.path) + suffix) for suffix in _SQLITE_SIDECARS))
+            lexical_location = self._configured_path
+            if not lexical_location.is_relative_to(root):
+                # macOS /var -> /private/var and checkout aliases must not hide
+                # an in-repository path before a descendant symlink escapes.
+                for ancestor in lexical_location.parents:
+                    if ancestor.resolve() == root:
+                        lexical_location = root / lexical_location.relative_to(ancestor)
+                        break
+            lexical_paths = (lexical_location, *(Path(str(lexical_location) + suffix) for suffix in _SQLITE_SIDECARS))
             # A database must never occupy SQLite's reserved sidecar pathname,
             # even when that sidecar does not exist yet.
-            if self.path.name.endswith(("-journal", "-wal", "-shm")):
+            if self.path.name.endswith(_SQLITE_SIDECARS):
                 raise RoomError("database_collision")
-            own_paths = (self.path, *(Path(str(self.path) + suffix) for suffix in ("-journal", "-wal", "-shm")))
             for protected in self.protected_paths:
-                for other in (protected, *(Path(str(protected) + suffix) for suffix in ("-journal", "-wal", "-shm"))):
+                for other in (protected, *(Path(str(protected) + suffix) for suffix in _SQLITE_SIDECARS)):
                     other = other.expanduser().resolve()
                     for candidate in own_paths:
                         candidate = candidate.resolve()
@@ -222,6 +286,18 @@ class RoomStore:
                             raise RoomError("database_collision")
                         if candidate.exists() and other.exists() and os.path.samefile(candidate, other):
                             raise RoomError("database_collision")
+            for candidate in (*lexical_paths, *own_paths):
+                resolved = candidate.resolve()
+                for location in (candidate, resolved):
+                    if location.is_relative_to(root):
+                        if not location.is_relative_to(private) or location == private:
+                            raise RoomError("invalid_input")
+                        # The private directory itself must not redirect storage
+                        # elsewhere, even when its symlink target is also in Git.
+                        if private.resolve() != private or not resolved.is_relative_to(private):
+                            raise RoomError("invalid_input")
+                if candidate.exists() and candidate.stat().st_nlink > 1:
+                    raise RoomError("database_collision")
             if self.path.name in {":memory:", ""} or self.path.is_dir():
                 raise RoomError("invalid_input")
         except RoomError:
@@ -252,16 +328,7 @@ class RoomStore:
             raise RoomError("database_collision")
         if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             raise RoomError("schema_mismatch")
-        objects = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-        )}
-        if objects != {"entries", "revisions", "invocations"}:
-            raise RoomError("schema_mismatch")
-        triggers = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
-        if not {
-            "immutable_revision_update", "immutable_revision_delete",
-            "immutable_receipt_update", "immutable_receipt_delete",
-        }.issubset(triggers):
+        if _schema_fingerprint(conn) != _expected_schema_fingerprint():
             raise RoomError("schema_mismatch")
 
     def initialize(self) -> None:

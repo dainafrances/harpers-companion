@@ -35,16 +35,17 @@ class FakeConfig:
 class FakeTree:
     def __init__(self) -> None:
         self.commands = []
+        self.translator = None
 
-    def add_command(self, command, *, override=False) -> None:
+    def add_command(self, command, *, guild=None, override=False) -> None:
         if override:
             self.commands = [existing for existing in self.commands if existing.name != command.name]
         self.commands.append(command)
 
-    def get_commands(self):
+    def get_commands(self, *, guild=None):
         return list(self.commands)
 
-    def remove_command(self, name, *, type):
+    def remove_command(self, name, *, guild=None, type=None):
         for command in self.commands:
             if command.name == name:
                 self.commands.remove(command)
@@ -160,18 +161,18 @@ class BecomingCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assert_private(interaction)
         self.assert_service_unused()
 
-    async def test_registration_is_storage_free_and_declares_only_guild_and_bot_dm(self):
+    async def test_registration_is_storage_free_and_declares_only_configured_context(self):
         self.assertEqual(
             [command.name for command in self.bot.tree.commands],
             ["becoming_want", "becoming_show", "becoming_revise", "becoming_history"],
         )
         for command in self.bot.tree.commands:
             self.assertTrue(command.allowed_contexts.guild)
-            self.assertTrue(command.allowed_contexts.dm_channel)
+            self.assertFalse(command.allowed_contexts.dm_channel)
             self.assertFalse(command.allowed_contexts.private_channel)
         self.assert_service_unused()
 
-    async def test_dm_sync_sends_only_room_globals_then_restores_legacy_commands(self):
+    async def test_sync_upserts_only_room_and_never_replaces_legacy_commands(self):
         async def legacy_callback(interaction: discord.Interaction):
             pass
 
@@ -179,26 +180,35 @@ class BecomingCommandTests(unittest.IsolatedAsyncioTestCase):
         self.bot.tree.add_command(legacy)
         original = set(self.bot.tree.get_commands())
 
-        async def sync():
-            self.assertEqual(set(self.bot.tree.get_commands()), set(self.callbacks.commands))
-            return ["synced"]
-
-        self.bot.tree.sync = AsyncMock(side_effect=sync)
-        result = await commands.sync_dm_commands(self.bot, self.callbacks)
-        self.assertEqual(result, ["synced"])
+        self.bot.application_id = 999
+        self.bot.tree.allowed_contexts = discord.app_commands.AppCommandContext()
+        self.bot.tree.allowed_installs = discord.app_commands.AppInstallationType()
+        self.bot.http = SimpleNamespace(upsert_global_command=AsyncMock(return_value="synced"))
+        self.bot.tree.sync = AsyncMock()
+        result = await commands.sync_room_commands(self.bot, self.callbacks, guild_id=None)
+        self.assertEqual(result, ["synced"] * 4)
+        self.assertEqual(self.bot.http.upsert_global_command.await_count, 4)
+        self.assertEqual(
+            {call.kwargs["payload"]["name"] for call in self.bot.http.upsert_global_command.call_args_list},
+            {command.name for command in self.callbacks.commands},
+        )
+        self.bot.tree.sync.assert_not_awaited()
         self.assertEqual(set(self.bot.tree.get_commands()), original)
         self.assert_service_unused()
 
-    async def test_dm_sync_restores_legacy_commands_after_sync_failure(self):
+    async def test_sync_failure_never_mutates_local_legacy_commands(self):
         async def legacy_callback(interaction: discord.Interaction):
             pass
 
         legacy = discord.app_commands.command(name="legacy", description="Existing command")(legacy_callback)
         self.bot.tree.add_command(legacy)
         original = set(self.bot.tree.get_commands())
-        self.bot.tree.sync = AsyncMock(side_effect=RuntimeError("Discord sync failed"))
+        self.bot.application_id = 999
+        self.bot.tree.allowed_contexts = discord.app_commands.AppCommandContext()
+        self.bot.tree.allowed_installs = discord.app_commands.AppInstallationType()
+        self.bot.http = SimpleNamespace(upsert_global_command=AsyncMock(side_effect=RuntimeError("Discord sync failed")))
         with self.assertRaises(RuntimeError):
-            await commands.sync_dm_commands(self.bot, self.callbacks)
+            await commands.sync_room_commands(self.bot, self.callbacks, guild_id=None)
         self.assertEqual(set(self.bot.tree.get_commands()), original)
         self.assert_service_unused()
 
@@ -222,11 +232,35 @@ class BecomingCommandTests(unittest.IsolatedAsyncioTestCase):
         self.config.valid = False
         await self.invoke_all(FakeInteraction)
 
-    async def test_every_command_fails_closed_without_service(self):
-        self.callbacks = commands.register_commands(
-            SimpleNamespace(tree=FakeTree()), config=self.config, service=None
-        )
-        await self.invoke_all(FakeInteraction)
+    async def test_disabled_invalid_and_missing_service_never_register(self):
+        for config, service in (
+            (FakeConfig(enabled=False), self.service),
+            (FakeConfig(valid=False), self.service),
+            (self.config, None),
+        ):
+            bot = SimpleNamespace(tree=FakeTree())
+            self.assertIsNone(commands.register_commands(bot, config=config, service=service))
+            self.assertEqual(bot.tree.get_commands(), [])
+        self.assert_service_unused()
+
+    async def test_repeated_registration_is_idempotent(self):
+        self.assertIs(commands.register_commands(self.bot, config=self.config, service=self.service), self.callbacks)
+        self.assertEqual(len(self.bot.tree.get_commands()), 4)
+
+    async def test_partial_registration_failure_rolls_back_only_added_room_commands(self):
+        client = discord.Client(intents=discord.Intents.none())
+        tree = discord.app_commands.CommandTree(client)
+        guild = discord.Object(id=30)
+
+        async def occupied(interaction: discord.Interaction):
+            pass
+
+        existing = discord.app_commands.Command(name="becoming_show", description="Existing", callback=occupied)
+        tree.add_command(existing, guild=guild)
+        with self.assertRaises(discord.app_commands.CommandAlreadyRegistered):
+            commands.register_commands(SimpleNamespace(tree=tree), config=self.config, service=self.service)
+        self.assertEqual(tree.get_commands(guild=guild), [existing])
+        await client.close()
 
     async def test_dm_only_route_rejects_group_dm_and_untyped_private_channel(self):
         self.config.guild_id = None

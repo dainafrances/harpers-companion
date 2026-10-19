@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import APIError, AsyncOpenAI
 
 from . import becoming, paintbox
 from .discord_recall import RECALL_POLICY
@@ -524,6 +524,59 @@ def _becoming_response_metadata(response: Any) -> dict[str, str]:
     }
 
 
+def _becoming_error_metadata(error: Exception) -> dict[str, str]:
+    """Read only named provenance fields from the SDK's structured error data.
+
+    APIStatusError.body may already be the nested ``error`` object, whereas its
+    HTTP response retains the complete envelope. Never search arbitrary nested
+    data, inspect message/raw fields, or return any error body itself.
+    """
+    metadata = _becoming_response_metadata(None)
+    if not isinstance(error, APIError):
+        return metadata
+
+    response = getattr(error, "response", None)
+    roots: list[dict[str, Any]] = []
+    if response is not None:
+        try:
+            payload = response.json()
+        except Exception:
+            pass  # A non-JSON body is not metadata and is never retained.
+        else:
+            if isinstance(payload, dict):
+                roots.append(payload)
+    if isinstance(error.body, dict):
+        roots.append(error.body)
+
+    sources: list[dict[str, Any]] = []
+    for root in roots:
+        sources.append(root)
+        if isinstance(root.get("metadata"), dict):
+            sources.append(root["metadata"])
+        nested_error = root.get("error")
+        if isinstance(nested_error, dict):
+            sources.append(nested_error)
+            if isinstance(nested_error.get("metadata"), dict):
+                sources.append(nested_error["metadata"])
+
+    def first_valid(*names: str) -> str:
+        for name in names:
+            for source in sources:
+                value = _becoming_metadata_value(source.get(name))
+                if value != "UNKNOWN":
+                    return value
+        return "UNKNOWN"
+
+    metadata["returned_model"] = first_valid("model")
+    metadata["returned_provider"] = first_valid("provider", "provider_name")
+    metadata["provider_response_id"] = first_valid("id", "response_id", "request_id")
+    if metadata["provider_response_id"] == "UNKNOWN":
+        metadata["provider_response_id"] = _becoming_metadata_value(getattr(error, "request_id", None))
+    if metadata["provider_response_id"] == "UNKNOWN" and response is not None:
+        metadata["provider_response_id"] = _becoming_metadata_value(response.headers.get("x-request-id"))
+    return metadata
+
+
 def _becoming_unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -616,8 +669,8 @@ async def generate_becoming_want(
             timeout=30.0,
         ), timeout=30.0)
     except Exception as error:
-        # Never retain exception text/bodies: they can contain private prompts.
-        metadata.update(_becoming_response_metadata(getattr(error, "response", None)))
+        # Retain only bounded, allowlisted provenance, never exception text/body.
+        metadata.update(_becoming_error_metadata(error))
         raise becoming.RoomModelError("provider_failure", metadata=metadata) from None
 
     metadata.update(_becoming_response_metadata(response))

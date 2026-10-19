@@ -7,9 +7,16 @@ import importlib
 import io
 import json
 import os
+import sqlite3
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+
+try:
+    import httpx2 as httpx
+except ImportError:  # Older supported OpenAI SDKs use httpx rather than httpx2.
+    import httpx
 
 
 os.environ.setdefault("OPENROUTER_API_KEY", "test-key")
@@ -242,15 +249,28 @@ class BecomingRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output.getvalue(), "")
         self.create.assert_awaited_once()
 
-    async def test_failure_retains_metadata_if_supplied_by_response(self):
+    async def test_non_sdk_exception_cannot_supply_provenance(self):
         error = RuntimeError("PRIVATE BODY")
         error.response = SimpleNamespace(model="failed/model", provider="Failed Provider", id="failed-1")
+        error.body = {"model": "failed/model", "provider": "Failed Provider", "id": "failed-1"}
         self.create.side_effect = error
+        with self.assertRaises(becoming.RoomModelError) as caught:
+            await router.generate_becoming_want()
+        for key in ("returned_model", "returned_provider", "provider_response_id"):
+            self.assertEqual(caught.exception.metadata[key], "UNKNOWN")
+
+    async def test_actual_sdk_error_body_without_http_response_retains_allowlist_only(self):
+        self.create.side_effect = router.APIError(
+            "PRIVATE BODY", request=httpx.Request("POST", "https://synthetic.invalid"),
+            body={"metadata": {"model": "failed/model", "provider_name": "Failed Provider",
+                               "response_id": "failed-1", "message": "PRIVATE BODY"}},
+        )
         with self.assertRaises(becoming.RoomModelError) as caught:
             await router.generate_becoming_want()
         self.assertEqual(caught.exception.metadata["returned_model"], "failed/model")
         self.assertEqual(caught.exception.metadata["returned_provider"], "Failed Provider")
         self.assertEqual(caught.exception.metadata["provider_response_id"], "failed-1")
+        self.assertNotIn("PRIVATE BODY", json.dumps(caught.exception.metadata))
 
     async def test_timeout_is_one_failed_invocation(self):
         self.create.side_effect = asyncio.TimeoutError()
@@ -268,6 +288,157 @@ class BecomingRouterTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(becoming.RoomModelError):
                 await router.generate_becoming_want(seed="PRIVATE SEED")
         self.assertEqual(output.getvalue(), "")
+
+
+class BecomingSDKErrorMetadataTests(unittest.IsolatedAsyncioTestCase):
+    """Exercise real SDK errors and transport serialization without the network."""
+
+    def setUp(self):
+        for replacement in (
+            patch.object(router, "build_system_prompt", return_value="SYNTHETIC_PRIVATE_IDENTITY"),
+            patch.dict(os.environ, {"MODEL_PRIMARY": "synthetic/requested-model"}),
+        ):
+            replacement.start()
+            self.addCleanup(replacement.stop)
+
+    async def failure_metadata(self, payload, *, headers=None, raw=False):
+        requests = []
+
+        def handler(request):
+            requests.append(json.loads(request.content))
+            kwargs = {"content": payload} if raw else {"json": payload}
+            return httpx.Response(503, headers=headers or {}, **kwargs)
+
+        async with router.AsyncOpenAI(
+            api_key="synthetic-test-key",
+            base_url="https://synthetic.invalid/api/v1",
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        ) as client:
+            with patch.object(router, "_client", client), self.assertLogs(level="DEBUG") as logs:
+                with self.assertRaises(becoming.RoomModelError) as caught:
+                    await router.generate_becoming_want(seed="SYNTHETIC_PRIVATE_SEED")
+
+        self.assertEqual(caught.exception.category, "provider_failure")
+        self.assertEqual(str(caught.exception), "provider_failure")
+        self.assertEqual(len(requests), 1)  # A 503 would trigger SDK retries without max_retries=0.
+        self.assertEqual(requests[0]["tools"], [])
+        self.assertEqual(requests[0]["messages"][0]["content"], "SYNTHETIC_PRIVATE_IDENTITY")
+        self.assertEqual(set(caught.exception.metadata), {
+            "requested_model", "returned_model", "returned_provider", "provider_response_id", "prompt_digest",
+        })
+        self.assertEqual(caught.exception.metadata["requested_model"], "synthetic/requested-model")
+        self.assertEqual(len(caught.exception.metadata["prompt_digest"]), 64)
+        self.assertNotIn("SYNTHETIC_PRIVATE", json.dumps(caught.exception.metadata))
+        self.assertNotIn("SYNTHETIC_PRIVATE", "\n".join(logs.output))
+        return caught.exception.metadata
+
+    async def test_actual_sdk_http_error_envelope_retains_metadata(self):
+        result = await self.failure_metadata({
+            "model": "failed/model", "provider": "Failed Provider", "id": "failed-response-1",
+            "error": {"message": "SYNTHETIC_PRIVATE_ERROR", "code": 503},
+        })
+        self.assertEqual(result["returned_model"], "failed/model")
+        self.assertEqual(result["returned_provider"], "Failed Provider")
+        self.assertEqual(result["provider_response_id"], "failed-response-1")
+
+    async def test_sdk_failure_persists_only_failed_receipt_and_allowlisted_metadata(self):
+        attempts = []
+
+        def handler(request):
+            attempts.append(request)
+            return httpx.Response(503, json={
+                "model": "failed/model", "provider": "Failed Provider", "id": "failed-response-1",
+                "error": {"message": "SYNTHETIC_PRIVATE_ERROR", "raw": "SYNTHETIC_PRIVATE_OUTPUT"},
+            })
+
+        with tempfile.TemporaryDirectory(prefix="becoming-sdk-error-") as temporary:
+            store = becoming.RoomStore(os.path.join(temporary, "room.sqlite3"))
+            service = becoming.RoomService(store, router.generate_becoming_want, "synthetic/requested-model")
+            async with router.AsyncOpenAI(
+                api_key="synthetic-test-key", base_url="https://synthetic.invalid/api/v1",
+                http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            ) as client:
+                with patch.object(router, "_client", client), self.assertLogs(level="DEBUG") as logs:
+                    receipt = await service.create(
+                        becoming.RoomScope("123", "456", "789"), "synthetic-failed-operation", "SYNTHETIC_PRIVATE_SEED",
+                    )
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(receipt["outcome"], "failed")
+            self.assertEqual(receipt["error_category"], "provider_failure")
+            self.assertEqual(receipt["returned_model"], "failed/model")
+            self.assertEqual(receipt["returned_provider"], "Failed Provider")
+            self.assertEqual(receipt["provider_response_id"], "failed-response-1")
+            self.assertIsNone(receipt["entry_id"])
+            with sqlite3.connect(store.path) as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM invocations").fetchone()[0], 1)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0], 0)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM revisions").fetchone()[0], 0)
+            self.assertNotIn(b"SYNTHETIC_PRIVATE", store.path.read_bytes())
+            self.assertNotIn("SYNTHETIC_PRIVATE", "\n".join(logs.output))
+
+    async def test_only_known_structured_locations_are_accepted(self):
+        metadata = {"model": "failed/model", "provider_name": "Failed Provider", "request_id": "failed-request-1"}
+        for payload in (
+            {"metadata": metadata},
+            {"error": metadata},
+            {"error": {"message": "SYNTHETIC_PRIVATE_ERROR", "metadata": metadata}},
+        ):
+            with self.subTest(payload=payload):
+                result = await self.failure_metadata(payload)
+                self.assertEqual(result["returned_model"], "failed/model")
+                self.assertEqual(result["returned_provider"], "Failed Provider")
+                self.assertEqual(result["provider_response_id"], "failed-request-1")
+
+    async def test_arbitrary_error_fields_and_nested_objects_are_ignored(self):
+        private = {"model": "SYNTHETIC_PRIVATE_MODEL", "provider": "SYNTHETIC_PRIVATE_PROVIDER",
+                   "id": "SYNTHETIC_PRIVATE_ID"}
+        result = await self.failure_metadata({
+            "message": private, "prompt": private, "seed": private, "entries": [private],
+            "raw": private, "debug": {"metadata": private},
+            "error": {"message": private, "raw": private, "debug": {"metadata": private},
+                      "metadata": {"prompt": private, "content": private, "raw": private}},
+        })
+        for key in ("returned_model", "returned_provider", "provider_response_id"):
+            self.assertEqual(result[key], "UNKNOWN")
+
+    async def test_invalid_metadata_types_lengths_and_controls_are_unknown(self):
+        for value in (None, 7, True, ["model"], {"model": "model"}, "", " ", "x" * 257, "bad\nvalue", "bad\x00value"):
+            with self.subTest(value=value):
+                result = await self.failure_metadata({"error": {"metadata": {
+                    "model": value, "provider": value, "provider_name": value,
+                    "id": value, "response_id": value, "request_id": value,
+                }}})
+                for key in ("returned_model", "returned_provider", "provider_response_id"):
+                    self.assertEqual(result[key], "UNKNOWN")
+
+    async def test_valid_metadata_boundary_and_response_id_precedence(self):
+        result = await self.failure_metadata({
+            "model": "m" * 256, "provider": "p" * 256,
+            "request_id": "body-request", "metadata": {"response_id": "response-first"},
+            "error": {"message": "SYNTHETIC_PRIVATE_ERROR"},
+        }, headers={"x-request-id": "header-request"})
+        self.assertEqual(result["returned_model"], "m" * 256)
+        self.assertEqual(result["returned_provider"], "p" * 256)
+        self.assertEqual(result["provider_response_id"], "response-first")
+
+    async def test_actual_sdk_request_id_header_is_a_bounded_fallback(self):
+        for request_id, expected in (("header-request", "header-request"), ("x" * 257, "UNKNOWN")):
+            with self.subTest(request_id=request_id):
+                result = await self.failure_metadata(
+                    {"error": {"message": "SYNTHETIC_PRIVATE_ERROR"}},
+                    headers={"x-request-id": request_id, "unrecognized-id": "SYNTHETIC_PRIVATE_ID"},
+                )
+                self.assertEqual(result["provider_response_id"], expected)
+                self.assertEqual(result["returned_model"], "UNKNOWN")
+                self.assertEqual(result["returned_provider"], "UNKNOWN")
+
+    async def test_non_object_or_non_json_error_bodies_are_not_provenance(self):
+        for payload, raw in (([{"model": "SYNTHETIC_PRIVATE_MODEL"}], False),
+                             ("SYNTHETIC_PRIVATE_RAW_BODY", True)):
+            with self.subTest(raw=raw):
+                result = await self.failure_metadata(payload, raw=raw)
+                for key in ("returned_model", "returned_provider", "provider_response_id"):
+                    self.assertEqual(result[key], "UNKNOWN")
 
 
 if __name__ == "__main__":

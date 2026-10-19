@@ -267,36 +267,44 @@ class RoomCommands:
     commands: tuple[app_commands.Command, ...]
 
 
-async def sync_dm_commands(bot: Any, registered_commands: RoomCommands) -> list[Any]:
-    """Sync Room globals without publishing legacy guild-only commands globally.
+async def sync_room_commands(
+    bot: Any, registered_commands: RoomCommands, *, guild_id: str | None
+) -> list[Any]:
+    """Upsert only Room definitions; never bulk-replace remote commands.
 
-    Call during the existing startup sync sequence. The removed definitions are
-    restored locally even when Discord rejects the sync; no storage is touched.
+    A partially rejected publication can safely be retried by command name.
+    Existing global and guild commands are never removed or re-published here.
     """
-    room_commands = set(registered_commands.commands)
-    removed: list[Any] = []
-    try:
-        for command in bot.tree.get_commands():
-            if command in room_commands:
-                continue
-            command_type = (
-                command.type
-                if isinstance(command, app_commands.ContextMenu)
-                else discord.AppCommandType.chat_input
+    if bot.application_id is None:
+        raise app_commands.MissingApplicationID
+    published = []
+    for command in registered_commands.commands:
+        if bot.tree.translator is None:
+            payload = command.to_dict(bot.tree)
+        else:
+            payload = await command.get_translated_payload(bot.tree, bot.tree.translator)
+        if guild_id is None:
+            result = await bot.http.upsert_global_command(bot.application_id, payload=payload)
+        else:
+            result = await bot.http.upsert_guild_command(
+                bot.application_id, int(guild_id), payload=payload
             )
-            previous = bot.tree.remove_command(command.name, type=command_type)
-            if previous is not None:
-                removed.append(previous)
-        return await bot.tree.sync()
-    finally:
-        for command in removed:
-            bot.tree.add_command(command, override=True)
+        published.append(result)
+    return published
 
 
 def register_commands(
     bot: Any, *, config: RoomConfig, service: RoomService | None
-) -> RoomCommands:
+) -> RoomCommands | None:
     """Register private commands without reading or initializing any storage."""
+    if not config.enabled or not config.valid or service is None:
+        return None
+    previous = getattr(bot, "_room_of_becoming_registration", None)
+    if previous is not None:
+        previous_config, previous_service, registered = previous
+        if previous_config != config or previous_service is not service:
+            raise RoomError("registration_conflict")
+        return registered
 
     async def prepare(interaction: discord.Interaction) -> RoomScope | None:
         scope = _scope(interaction, config)
@@ -398,13 +406,28 @@ def register_commands(
     )
     discord_commands = []
     for callback, description in definitions:
-        private_contexts = app_commands.allowed_contexts(guilds=True, dms=True, private_channels=False)
+        private_contexts = app_commands.allowed_contexts(
+            guilds=config.guild_id is not None,
+            dms=config.guild_id is None,
+            private_channels=False,
+        )
         command = app_commands.command(name=callback.__name__, description=description)(
             private_contexts(callback)
         )
-        bot.tree.add_command(command)
         discord_commands.append(command)
 
-    return RoomCommands(
+    registered = RoomCommands(
         becoming_want, becoming_show, becoming_revise, becoming_history, tuple(discord_commands)
     )
+    guild = discord.Object(id=int(config.guild_id)) if config.guild_id is not None else None
+    added = []
+    try:
+        for command in registered.commands:
+            bot.tree.add_command(command, guild=guild)
+            added.append(command)
+    except Exception:
+        for command in added:
+            bot.tree.remove_command(command.name, guild=guild)
+        raise
+    bot._room_of_becoming_registration = (config, service, registered)
+    return registered

@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 .venv/
 .env
+# Every accepted in-repository Room database, sidecar and export stays private.
+data/room-of-becoming/
 # Private runtime databases, including SQLite journals, WAL and shared-memory files.
 data/*.sqlite*
 data/*.db

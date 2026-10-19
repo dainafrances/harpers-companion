@@ -58,18 +58,69 @@ The ordinary message-routing gate is not authorization for these slash commands.
 Discord channel permissions remain an additional deployment concern. An ephemeral
 guild response is not a substitute for the owner and exact-route checks.
 
+The inherited shared `BOT_OWNER_DISCORD_ID` startup parser is outside the Room
+repair scope. [RB-OWN-001](BACKLOG.md) records its future correction without
+weakening authorization: malformed configuration must never mean an absent owner
+or unrestricted access.
+
+## Optional registration and startup
+
+Room definitions must not enter the first legacy guild/global command sync. There
+is no import-time or disabled/invalid-configuration Room registration, and no
+Room-specific sync in those states.
+
+Ordinary command startup is independent. Existing journal and status timers can
+start before separately guarded optional Room registration/synchronization. A
+Room registration or sync failure is caught and reduced to bounded diagnostics;
+it cannot interrupt ordinary companion operation or be marked as a successful
+Room sync. Registration is idempotent, successful reconnects do not duplicate
+commands or timer starts, and an unsuccessful Room-only sync may be retried on a
+later reconnect.
+
+For a guild route, Room commands sync only to that configured guild and are not
+published globally. For a DM route, the separate Room global sync preserves
+already-working ordinary global command definitions. Its failure cannot undo or
+interrupt commands that were already operating. Command availability never grants
+entry access; the exact owner/route checks still apply on every invocation.
+
 ## Persistence and schema version
 
-The dedicated database defaults to `data/room_of_becoming.sqlite3` and is configured
-by `BECOMING_DB_PATH`. It must not reuse `colin_memory.sqlite3`, Paintbox's usage
+The dedicated database defaults to
+`data/room-of-becoming/room_of_becoming.sqlite3` and is configured by
+`BECOMING_DB_PATH`. It must not reuse `colin_memory.sqlite3`, Paintbox's usage
 database, or another application's database. Initialization must reject a known
 application-path collision and an existing database with a conflicting marker or
 schema rather than adopting or modifying it.
 
+All accepted in-repository storage lives within the one dedicated private
+directory `data/room-of-becoming/`. Git ignores that entire directory, including
+nested paths, extensionless files, SQLite sidecars and exports. Validation resolves
+and checks paths before opening SQLite. Repository-root files and other
+in-repository directories are rejected regardless of filename suffix or other
+ignore patterns. Traversal attempts, symlink escapes and paths whose SQLite
+sidecars leave the protected directory are rejected before provider invocation or
+private-data creation. Invalid old custom paths fail closed rather than being
+silently moved or adopted.
+
+The old default `data/room_of_becoming.sqlite3` is not discovered automatically
+by the new default. An existing installation requires operator confirmation of
+the actual database, a consistent backup and explicit authority for any
+relocation before enabling this configuration. This repair does not migrate
+existing storage or silently start using an old database at a new location.
+
+Genuine paths outside the repository may be used after application-database,
+symlink, hardlink and sidecar collision protections. The application does not run
+Git at normal runtime; it enforces the storage boundary itself.
+
 The database uses SQLite `PRAGMA application_id=0x52423031` (`RB01`) and sets
-`PRAGMA user_version=1`. Unsupported versions fail closed. Versioning begins with
-this release; future schema upgrades require an explicit migration rather than relying only on
-`CREATE TABLE IF NOT EXISTS`.
+`PRAGMA user_version=1`. Unsupported versions fail closed. Required tables,
+indexes and triggers must match deterministic normalized schema definitions, not
+only object names. Ignore only legitimate SQLite internal objects; missing,
+altered or unexpected application objects fail closed, including a same-named
+but ineffective immutability trigger. A valid database initializes idempotently.
+Rejection does not silently repair, migrate, recreate or overwrite definitions,
+bytes or stored user data. Future schema upgrades require an explicit migration
+rather than relying only on `CREATE TABLE IF NOT EXISTS`.
 
 The separate tables are `invocations`, `entries` and `revisions`:
 
@@ -89,6 +140,14 @@ Authorization IDs and operation keys come from trusted application context, not
 model output. Record the model requested and retain provider response metadata
 when available. Unavailable returned model, provider or response metadata is
 `UNKNOWN`; never infer it from the requested model's name.
+
+SDK failures expose HTTP responses and structured error bodies rather than
+completion objects. Only explicitly allowlisted returned model, provider and
+response/request-ID fields from known structured locations may be retained.
+Values must have bounded lengths and valid types; absent or invalid values remain
+`UNKNOWN`. Do not retain or log the raw HTTP body, arbitrary provider error text,
+private prompts, seeds, revisions, entry text or model output. Retaining metadata
+does not turn a provider failure into a successful invocation or create an entry.
 
 Store a prompt version or digest rather than raw private prompts. Do not request
 or store private chain-of-thought. Logging may record bounded operational/error
@@ -197,8 +256,9 @@ and backup access to the operating account and authorized operators. Environment
 secrets remain in deployment configuration, never in the database or Git. The
 repository is public; never commit runtime Room entries, private exports,
 credentials or database files, including SQLite WAL/shared-memory/journal
-sidecars. Ignore rules cover the default data location, not arbitrary custom
-paths; operators must protect a custom path and its backups as well.
+sidecars. Every accepted in-repository Room path is inside the dedicated ignored
+directory; externally configured paths and their backups still need private
+operator-controlled permissions and retention.
 
 A persistent volume is not a backup. An operator-managed backup must use SQLite's
 backup API or a consistent stopped-writer snapshot. Copying only a live main file
@@ -230,10 +290,29 @@ Automated tests must cover at least:
 12. Guild responses are ephemeral and every Room response disables mentions.
 13. Ordinary memory, journal, continuity, identity, status, recall and image paths remain untouched by Room operations.
 14. A configured path colliding with known application databases is rejected.
+15. Only protected-directory in-repository paths are accepted, including safe nested/extensionless paths. Root/outside-directory paths, traversal, symlink escapes and unsafe sidecars are rejected before artifact creation; a genuine external temporary path is accepted. No stageable database artifacts remain after tests.
+16. Optional Room definitions never enter the initial legacy sync. Disabled/invalid configuration adds none. Guild-only and DM/global paths, initial legacy rejection, Room-only rejection, reconnect retries and successful reconnects preserve ordinary commands and single timer starts.
+17. Actual provider SDK exceptions with mock HTTP transport retain only allowlisted structured error metadata and still produce no entry.
+18. Same-named no-op update/delete triggers, changed table/index definitions, missing objects and unexpected objects are rejected without changing existing database bytes/data. Valid initialization remains repeatable, and older revisions remain immutable through normal APIs.
 
-Run Room tests and the existing full suite where practical, reporting exact
-commands and results. Test source and passing mocked tests do not establish a
-production deployment or live Discord behavior.
+For accepted repairs, run Room tests, the full suite, the shuffled full suite,
+`compileall`, `pip check`, whitespace/diff checks and each original adversarial
+reproduction. Report exact commands/results and whether each original finding can
+still reproduce; aggregate test counts alone are insufficient. Test source and
+passing mocked tests do not establish a production deployment or live Discord
+behavior.
+
+The synthetic end-to-end check uses invented content with a disposable protected
+or external database and no production application, provider credentials,
+Railway environment or database. When explicitly non-production isolated
+credentials are unavailable, use actual `discord.py` command objects and the
+actual provider SDK with deterministic mock transports. Exercise disabled then
+enabled startup, create/show/revise/history, fresh-process persistence,
+deduplication, stale revision, abstention, malformed/provider/storage failures,
+owner/route denial, invalid paths, optional sync failure and legacy-boundary
+inspection. Clean up synthetic artifacts. Live network behavior remains
+**NOT VERIFIED** unless it is actually exercised with authorized isolated
+credentials.
 
 Local manual verification must use a separate test Discord application and a
 fresh temporary absolute `BECOMING_DB_PATH`, with isolated ordinary data as well.

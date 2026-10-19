@@ -154,10 +154,15 @@ class StoreTests(unittest.TestCase):
 
     def test_write_failure_rolls_back_entry_revision_and_success_receipt(self):
         invocation = self.begin()
-        with sqlite3.connect(self.path) as conn:
-            conn.execute("CREATE TRIGGER inject_failure BEFORE UPDATE ON invocations BEGIN SELECT RAISE(ABORT,'fixture'); END")
-        with self.assertRaisesRegex(room.RoomError, "storage_failure"):
-            self.store.write_revision(invocation_id=invocation["invocation_id"], scope=SCOPE, result=result())
+
+        def fail_completion(conn, *args, **kwargs):
+            # Fail with real SQLite constraint enforcement after entry/revision
+            # inserts, without introducing a now-forbidden schema alteration.
+            conn.execute("INSERT INTO invocations(invocation_id) VALUES (NULL)")
+
+        with patch.object(self.store, "_complete", side_effect=fail_completion):
+            with self.assertRaisesRegex(room.RoomError, "storage_failure"):
+                self.store.write_revision(invocation_id=invocation["invocation_id"], scope=SCOPE, result=result())
         self.assertEqual(self.rows("entries"), [])
         self.assertEqual(self.rows("revisions"), [])
         with sqlite3.connect(self.path) as conn:
@@ -226,6 +231,201 @@ class StoreTests(unittest.TestCase):
         with self.assertRaisesRegex(room.RoomError, "schema_mismatch"):
             self.store.initialize()
         self.assertEqual(self.path.read_bytes(), before)
+
+    def test_altered_schema_definitions_rejected_without_changing_bytes_or_data(self):
+        first = self.create()
+        expected_history = self.store.get_history(first["entry_id"], SCOPE)
+        modifications = {
+            "same_named_noop_update_trigger": (
+                "DROP TRIGGER immutable_revision_update",
+                "CREATE TRIGGER immutable_revision_update BEFORE UPDATE ON revisions BEGIN SELECT 1; END",
+            ),
+            "same_named_noop_delete_trigger": (
+                "DROP TRIGGER immutable_revision_delete",
+                "CREATE TRIGGER immutable_revision_delete BEFORE DELETE ON revisions BEGIN SELECT 1; END",
+            ),
+            "required_table_changed": ("ALTER TABLE entries ADD COLUMN unexpected TEXT",),
+            "required_index_changed": (
+                "DROP INDEX idx_entries_scope",
+                "CREATE INDEX idx_entries_scope ON entries(channel_id)",
+            ),
+            "required_index_missing": ("DROP INDEX idx_entries_scope",),
+            "unexpected_view": ("CREATE VIEW unexpected AS SELECT * FROM entries",),
+            "unexpected_index": ("CREATE INDEX unexpected ON entries(status)",),
+            # The previous LIKE 'sqlite_%' filter mistook '_' for a wildcard.
+            "sqlite_prefix_lookalike": ("CREATE TABLE sqliteXunexpected(content TEXT)",),
+        }
+        for label, statements in modifications.items():
+            with self.subTest(label=label):
+                candidate = Path(self.temp.name) / (label + ".sqlite3")
+                with sqlite3.connect(self.path) as source, sqlite3.connect(candidate) as target:
+                    source.backup(target)
+                with sqlite3.connect(candidate) as conn:
+                    for statement in statements:
+                        conn.execute(statement)
+                    before_history = conn.execute("SELECT * FROM revisions ORDER BY revision_number").fetchall()
+                before_bytes = candidate.read_bytes()
+                with self.assertRaisesRegex(room.RoomError, "schema_mismatch"):
+                    room.RoomStore(candidate).initialize()
+                self.assertEqual(candidate.read_bytes(), before_bytes)
+                with sqlite3.connect(candidate) as conn:
+                    self.assertEqual(conn.execute("SELECT * FROM revisions ORDER BY revision_number").fetchall(), before_history)
+        self.assertEqual(self.store.get_history(first["entry_id"], SCOPE), expected_history)
+
+    def test_analyze_statistics_are_legitimate_internal_objects(self):
+        first = self.create()
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("ANALYZE")
+        before = self.path.read_bytes()
+        self.store.initialize()
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.store.get_entry(first["entry_id"], SCOPE)["content"], result().content)
+
+    def test_schema_normalization_preserves_quoted_literals(self):
+        self.assertEqual(room._normalized_schema_sql("CREATE\n TABLE x(a TEXT)"), "CREATE TABLE x(a TEXT)")
+        self.assertNotEqual(room._normalized_schema_sql("DEFAULT 'two  spaces'"),
+                            room._normalized_schema_sql("DEFAULT 'two spaces'"))
+
+
+class PrivatePathTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="becoming-private-path-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve() / "checkout"
+        self.root.mkdir()
+        self.private = self.root / room.PRIVATE_STORAGE_DIRECTORY
+        self.root_patch = patch.object(room, "REPOSITORY_ROOT", self.root)
+        self.root_patch.start()
+        self.addCleanup(self.root_patch.stop)
+
+    def test_default_and_nested_paths_are_inside_the_private_directory(self):
+        config = room.RoomConfig.from_env({})
+        self.assertEqual(config.db_path, Path("data/room-of-becoming/room_of_becoming.sqlite3"))
+        paths = (self.root / config.db_path, self.private / "nested" / "extensionless")
+        for path in paths:
+            with self.subTest(path=path.relative_to(self.root)):
+                store = room.RoomStore(path)
+                store.initialize()
+                self.assertTrue(path.is_file())
+                self.assertTrue(store.path.is_relative_to(self.private))
+
+    def test_other_in_repository_paths_are_rejected_before_creation(self):
+        candidates = (
+            self.root / "private-room.sqlite3",
+            self.root / "data/nested/room.sqlite3",
+            self.root / "data/private-room",
+            self.root / "room.sqlite3-wal",
+            self.private,
+        )
+        for path in candidates:
+            with self.subTest(path=path):
+                with self.assertRaises(room.RoomError):
+                    room.RoomStore(path)
+                self.assertFalse(path.exists())
+        self.assertEqual(list(self.root.rglob("*")), [])
+
+    def test_traversal_is_rejected_even_when_resolution_would_be_allowed(self):
+        for path in (self.private / ".." / "outside.sqlite3",
+                     self.private / "nested" / ".." / "room.sqlite3",
+                     self.root / ".." / "external.sqlite3"):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(room.RoomError, "invalid_input"):
+                    room.RoomStore(path)
+        self.assertEqual(list(self.root.rglob("*")), [])
+
+    def test_private_directory_and_descendant_symlink_escapes_rejected(self):
+        external = Path(self.temp.name) / "external"
+        external.mkdir()
+        self.private.parent.mkdir(parents=True)
+        self.private.symlink_to(external, target_is_directory=True)
+        with self.assertRaisesRegex(room.RoomError, "invalid_input"):
+            room.RoomStore(self.private / "room.sqlite3")
+        self.private.unlink()
+        self.private.mkdir()
+        (self.private / "nested").symlink_to(external, target_is_directory=True)
+        with self.assertRaisesRegex(room.RoomError, "invalid_input"):
+            room.RoomStore(self.private / "nested" / "room.sqlite3")
+        (self.root / "alias").symlink_to(external, target_is_directory=True)
+        with self.assertRaisesRegex(room.RoomError, "invalid_input"):
+            room.RoomStore(self.root / "alias" / "room.sqlite3")
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_sidecar_escape_rejected_before_database_or_target_created(self):
+        self.private.mkdir(parents=True)
+        for suffix in ("-journal", "-wal", "-shm"):
+            with self.subTest(suffix=suffix):
+                path = self.private / "room.sqlite3"
+                target = Path(self.temp.name) / ("external" + suffix)
+                sidecar = Path(str(path) + suffix)
+                sidecar.symlink_to(target)
+                try:
+                    with self.assertRaisesRegex(room.RoomError, "invalid_input"):
+                        room.RoomStore(path)
+                    self.assertFalse(path.exists())
+                    self.assertFalse(target.exists())
+                finally:
+                    sidecar.unlink()
+
+    def test_checkout_alias_cannot_hide_a_private_directory_symlink_escape(self):
+        external = Path(self.temp.name).resolve() / "external"
+        external.mkdir()
+        self.private.parent.mkdir(parents=True)
+        self.private.symlink_to(external, target_is_directory=True)
+        alias = Path(self.temp.name).resolve() / "checkout-alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(room.RoomError, "invalid_input"):
+            room.RoomStore(alias / room.DEFAULT_DB_PATH)
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_paths_are_revalidated_after_construction_before_opening_sqlite(self):
+        self.private.mkdir(parents=True)
+        path = self.private / "room.sqlite3"
+        store = room.RoomStore(path)
+        external = Path(self.temp.name) / "external-wal"
+        Path(str(path) + "-wal").symlink_to(external)
+        with self.assertRaisesRegex(room.RoomError, "invalid_input"):
+            store.initialize()
+        self.assertFalse(path.exists())
+        self.assertFalse(external.exists())
+
+    def test_valid_external_directory_remains_supported(self):
+        path = Path(self.temp.name) / "external" / "room.sqlite3"
+        store = room.RoomStore(path)
+        store.initialize()
+        self.assertTrue(path.exists())
+        self.assertEqual(list(self.root.rglob("*")), [])
+
+    def test_external_hardlink_to_stageable_in_repository_artifact_rejected(self):
+        inside = self.root / "stageable.sqlite3"
+        inside.touch()
+        outside = Path(self.temp.name) / "external.sqlite3"
+        os.link(inside, outside)
+        with self.assertRaisesRegex(room.RoomError, "database_collision"):
+            room.RoomStore(outside)
+        self.assertEqual(inside.read_bytes(), b"")
+
+    def test_dedicated_directory_and_arbitrary_sidecars_are_gitignored(self):
+        # This read-only Git check belongs to tests; application path validation
+        # does not invoke Git or initialize the actual private data directory.
+        actual_root = Path(room.__file__).resolve().parents[1]
+        candidates = [str(room.PRIVATE_STORAGE_DIRECTORY / name) for name in (
+            "room_of_becoming.sqlite3", "room_of_becoming.sqlite3-wal",
+            "room_of_becoming.sqlite3-shm", "room_of_becoming.sqlite3-journal",
+            "nested/extensionless", "nested/extensionless-wal",
+        )]
+        checked = subprocess.run(["git", "check-ignore", "--stdin"], cwd=actual_root,
+                                 input="\n".join(candidates) + "\n", text=True, capture_output=True, check=True)
+        self.assertEqual(checked.stdout.splitlines(), candidates)
+
+    def test_private_path_fixtures_are_removed_without_stageable_artifacts(self):
+        with tempfile.TemporaryDirectory(dir=self.private.parent if self.private.parent.exists() else self.root) as sandbox:
+            root = Path(sandbox)
+            with patch.object(room, "REPOSITORY_ROOT", root):
+                path = root / room.DEFAULT_DB_PATH
+                room.RoomStore(path).initialize()
+                self.assertTrue(path.exists())
+        self.assertFalse(root.exists())
+        self.assertEqual(list(self.root.rglob("*.sqlite*")), [])
 
 
 class ServiceTests(unittest.IsolatedAsyncioTestCase):
