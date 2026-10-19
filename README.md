@@ -105,10 +105,21 @@ ignored `data/room-of-becoming/` directory. Nested and extensionless database
 names inside that directory are protected with their SQLite sidecars. Other
 in-repository paths are rejected, including repository-root files and other
 subdirectories, even when a filename happens to match an ignore rule. Traversal
-and symlink escapes are rejected before SQLite or a provider request. Genuine
+and symlink escapes are rejected before SQLite or a provider request. Containment
+uses the filesystem identity of existing path components and the nearest
+existing ancestors. Paths physically outside the protected directory but inside
+the repository are rejected even through alternate-case spellings; a harmless
+case alias within the same physical protected directory is allowed. SQLite's
+reserved `-wal`, `-shm` and `-journal`
+suffixes are rejected as database names in any letter case. Genuine
 external paths remain configurable after application-database, symlink,
 hardlink and sidecar collision checks. The runtime does not invoke Git to decide
 whether a path is safe.
+
+The intended deployment has one service using a fixed private volume. Room
+connections and validation are serialized within that process. Another process
+with filesystem write access could still replace a path between validation and
+opening it; that residual race is outside this single-service storage boundary.
 
 The previous default, `data/room_of_becoming.sqlite3`, is now rejected when
 configured explicitly. The new default does not discover or relocate an old
@@ -126,6 +137,29 @@ on reconnect without starting duplicate timers or discarding ordinary commands.
 Guild configuration syncs Room commands to its exact guild without publishing
 them globally. DM configuration uses a separate global sync that preserves
 already-working ordinary global commands.
+
+Exact owner/channel/guild checks protect execution and entry content, rather than
+hiding command names. Guild Room names may be discoverable throughout that guild,
+subject to Discord permissions. DM Room names are application-global definitions
+with bot-DM context; local checks still permit execution only in the configured
+owner's exact one-to-one DM.
+
+Disabling the Room means no local Room registration, no Room publication/sync
+attempt and no executable Room operation. It does not guarantee immediate removal
+of previously published remote definitions. After a disabled restart and a
+successful ordinary sync:
+
+| Previous Room publication | Ordinary sync scope | Remote Room names |
+| --- | --- | --- |
+| DM/global | Configured guilds only | Remain globally published. |
+| DM/global | Global | Removed by the ordinary global bulk sync. |
+| Guild included in ordinary sync | That guild | Removed by the ordinary guild bulk sync. |
+| Separate guild outside ordinary sync | Other configured guilds | Remain in the separate guild. |
+
+A surviving stale definition has no local callback. Dispatch fails closed with
+`CommandNotFound`, performs no provider or Room-storage work and may appear as an
+unanswered command in Discord. A Room-specific disabled acknowledgement is not
+guaranteed. No remote-deletion feature is implemented in Phase 1.
 
 Commands:
 
@@ -153,6 +187,17 @@ continuity, status, images, identity construction, or canonical memory. Creation
 uses the existing identity bundle and the explicit seed; revision adds only the
 stored revision being revised and the explicit instruction. Private prompt text
 and chain-of-thought are not stored as provenance.
+
+An existing database is validated before any writable connection to the original.
+Validation uses a private, disposable external snapshot of the database and any
+present WAL/journal; SQLite rebuilds its temporary shared-memory index there and
+inspects the complete committed state, including outstanding WAL changes. Invalid
+schema rejection preserves the original database, WAL, SHM and journal bytes and
+existence states. The validation copies are cleaned up; no immutable-mode shortcut
+is used to ignore WAL data. Valid databases, including valid WAL databases, may
+then open normally. This validation does not migrate an altered schema.
+An empty existing unmarked file is rejected. Only a file exclusively created by
+the current initialization may receive its first schema.
 
 Long entries and complete histories use private page controls without truncating
 stored content. The controls expire after 14 minutes; rerun `/becoming_show` or

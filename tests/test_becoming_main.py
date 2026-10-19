@@ -44,7 +44,7 @@ class _Timer:
 class StartupHarness:
     """Real command tree and serialization, with only HTTP/storage/timers fake."""
 
-    def __init__(self, *, guilds=(777,), room_guild="", enabled=True, valid=True):
+    def __init__(self, *, guilds=(777,), room_guild="", enabled=True, valid=True, remote_state=None):
         self.guilds, self.room_guild = set(guilds), room_guild
         self.config = RoomConfig.from_env({
             "BECOMING_ENABLED": "true" if enabled else "false",
@@ -52,8 +52,13 @@ class StartupHarness:
             "BECOMING_CHANNEL_ID": "456", "BECOMING_GUILD_ID": room_guild,
         })
         self.events, self.bulk_attempts, self.upserts, self.logs = [], [], [], []
-        self.remote_global = {"existing_global": {"name": "existing_global"}}
-        self.remote_guilds = {}
+        # Remote definitions belong to Discord, not to a bot process. Reuse this
+        # same state across separate harnesses to model a real restart.
+        self.remote_state = remote_state if remote_state is not None else {
+            "global": {"existing_global": {"name": "existing_global"}}, "guilds": {},
+        }
+        self.remote_global = self.remote_state["global"]
+        self.remote_guilds = self.remote_state["guilds"]
         self.legacy_failures = self.room_failures = self.registration_failures = 0
         self.room_fail_name = None
         self.registration_attempts = 0
@@ -65,6 +70,9 @@ class StartupHarness:
     async def __aenter__(self):
         self.client = discord.Client(intents=discord.Intents.none())
         self.client._connection.application_id = 111
+        self.client._connection.user = discord.ClientUser(state=self.client._connection, data={
+            "id": "111", "username": "SyntheticBot", "discriminator": "0", "avatar": None, "bot": True,
+        })
         self.tree = app_commands.CommandTree(self.client)
         # Copy the actual initial tree rather than inventing a legacy-only tree:
         # an import-time Room leak must make the primary-sync tests fail.
@@ -75,7 +83,9 @@ class StartupHarness:
         self.fake_bot = SimpleNamespace(
             tree=self.tree, user="synthetic bot", application_id=111, http=self.client.http,
         )
-        self.service = SimpleNamespace()
+        self.service = SimpleNamespace(
+            create=AsyncMock(), show=AsyncMock(), revise=AsyncMock(), history=AsyncMock(),
+        )
         actual_register = main.becoming_commands.register_commands
 
         def register(*args, **kwargs):
@@ -141,7 +151,8 @@ class StartupHarness:
             raise RuntimeError("synthetic ordinary sync failure PRIVATE ERROR")
         remote = {command["name"]: dict(command) for command in payload}
         if guild_id is None:
-            self.remote_global = remote
+            self.remote_global.clear()
+            self.remote_global.update(remote)
         else:
             self.remote_guilds[guild_id] = remote
         return []
@@ -190,6 +201,99 @@ class BecomingStartupTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(len(harness.bulk_attempts), 1)
                     harness.assert_primary_payloads(self)
                     harness.assert_timers_once(self)
+
+    async def _enabled_to_disabled_restart(self, *, guilds, room_guild, remains):
+        remote_state = {"global": {"existing_global": {"name": "existing_global"}}, "guilds": {}}
+        scope = int(room_guild) if room_guild else None
+
+        def remote_commands():
+            return remote_state["global"] if scope is None else remote_state["guilds"].get(scope, {})
+
+        async with StartupHarness(guilds=guilds, room_guild=room_guild, remote_state=remote_state) as enabled:
+            await enabled.ready()
+            self.assertTrue(main.startup_synced and main.becoming_synced)
+            self.assertEqual({guild for guild, _ in enabled.upserts}, {scope})
+            self.assertTrue(ROOM_NAMES <= set(remote_commands()))
+            for name in ROOM_NAMES:
+                # The actual serializer exposes guild or bot-DM context, not an
+                # exact owner/channel discoverability restriction.
+                self.assertEqual(remote_commands()[name]["contexts"], [1] if scope is None else [0])
+            previous_room = {name: dict(remote_commands()[name]) for name in ROOM_NAMES}
+            enabled.assert_primary_payloads(self)
+            enabled.assert_timers_once(self)
+
+        provider = AsyncMock(side_effect=AssertionError("Disabled Room invoked provider"))
+        storage = {
+            name: Mock(side_effect=AssertionError("Disabled Room accessed storage"))
+            for name in ("initialize", "begin_invocation", "write_revision", "finish_without_entry", "get_entry", "get_history")
+        }
+        with ExitStack() as denied_access:
+            denied_access.enter_context(patch.object(main, "generate_becoming_want", provider))
+            for name, guard in storage.items():
+                denied_access.enter_context(patch.object(main.becoming.RoomStore, name, guard))
+            async with StartupHarness(
+                guilds=guilds, room_guild=room_guild, enabled=False, remote_state=remote_state,
+            ) as disabled:
+                # This is a new client/tree/process model with the SAME remote
+                # dictionaries, not a fresh empty Discord command inventory.
+                self.assertIs(disabled.remote_state, remote_state)
+                await disabled.ready()
+                await disabled.ready()
+                self.assertTrue(main.startup_synced)
+                self.assertFalse(main.becoming_synced)
+                self.assertIsNone(main.becoming_callbacks)
+                self.assertEqual(disabled.registration_attempts, 0)
+                self.assertEqual(disabled.upserts, [])
+                disabled.client.http.upsert_global_command.assert_not_awaited()
+                disabled.client.http.upsert_guild_command.assert_not_awaited()
+                current_room = {name: remote_commands()[name] for name in ROOM_NAMES if name in remote_commands()}
+                self.assertEqual(current_room, previous_room if remains else {})
+                for name in ROOM_NAMES:
+                    self.assertIsNone(disabled.tree.get_command(name))
+                    if scope is not None:
+                        self.assertIsNone(disabled.tree.get_command(name, guild=discord.Object(id=scope)))
+                    data = {
+                        "id": "100000000000000001", "application_id": "111", "type": 2,
+                        "token": "synthetic-disabled-interaction", "version": 1, "attachment_size_limit": 10000000,
+                        "channel": {"id": "456", "type": 1 if scope is None else 0,
+                                    "name": "synthetic-room", "position": 0, "permission_overwrites": []},
+                        "user": {"id": "123", "username": "Synthetic", "discriminator": "0", "avatar": None},
+                        "app_permissions": "0", "data": {"id": "999", "name": name, "type": 1, "options": []},
+                    }
+                    if scope is not None:
+                        data["guild_id"] = str(scope)
+                        data["data"]["guild_id"] = str(scope)
+                        data["member"] = {"user": data["user"], "roles": [],
+                                          "joined_at": "2026-10-19T00:00:00Z", "deaf": False, "mute": False, "flags": 0}
+                    interaction = discord.Interaction(data=data, state=disabled.client._connection)
+                    # Actual discord.py dispatch fails before argument handling
+                    # or a Room callback. It does not send a Room-specific reply.
+                    with self.assertRaises(app_commands.CommandNotFound):
+                        await disabled.tree._call(interaction)
+                    self.assertFalse(interaction.response.is_done())
+                for method in (disabled.service.create, disabled.service.show, disabled.service.revise, disabled.service.history):
+                    method.assert_not_awaited()
+                ordinary = SimpleNamespace(response=SimpleNamespace(send_message=AsyncMock()))
+                await disabled.tree.get_command("ping").callback(ordinary)
+                ordinary.response.send_message.assert_awaited_once_with("Awake, steady, and listening.", ephemeral=True)
+                self.assertTrue(disabled.journal.running and disabled.refresh.running)
+                disabled.assert_primary_payloads(self)
+                disabled.assert_timers_once(self)
+        provider.assert_not_awaited()
+        for guard in storage.values():
+            guard.assert_not_called()
+
+    async def test_disabled_restart_keeps_dm_globals_outside_ordinary_guild_sync(self):
+        await self._enabled_to_disabled_restart(guilds=(777,), room_guild="", remains=True)
+
+    async def test_disabled_restart_removes_dm_globals_in_ordinary_global_sync(self):
+        await self._enabled_to_disabled_restart(guilds=(), room_guild="", remains=False)
+
+    async def test_disabled_restart_removes_room_guild_in_ordinary_guild_sync(self):
+        await self._enabled_to_disabled_restart(guilds=(777,), room_guild="777", remains=False)
+
+    async def test_disabled_restart_keeps_separate_room_guild_outside_ordinary_sync(self):
+        await self._enabled_to_disabled_restart(guilds=(777,), room_guild="999", remains=True)
 
     async def test_same_and_separate_guild_routes_never_publish_room_globally(self):
         for room_guild in ("777", "999"):

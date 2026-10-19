@@ -10,7 +10,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
+import tempfile
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -27,6 +30,9 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PRIVATE_STORAGE_DIRECTORY = Path("data/room-of-becoming")
 DEFAULT_DB_PATH = PRIVATE_STORAGE_DIRECTORY / "room_of_becoming.sqlite3"
 _SQLITE_SIDECARS = ("-journal", "-wal", "-shm")
+# Snapshot preflights must not overlap this process's ordinary Room writes or
+# checkpoints. Provider calls never hold this lock. Phase 1 has one Room store.
+_STORAGE_LOCK = threading.RLock()
 ERROR_CATEGORIES = frozenset({
     "storage_failure", "database_collision", "schema_mismatch", "invalid_input",
     "not_found", "stale_revision", "operation_conflict", "operation_incomplete",
@@ -235,6 +241,59 @@ def _expected_schema_fingerprint() -> str:
         conn.close()
 
 
+def _filesystem_identity(path: Path) -> tuple[int, int] | None:
+    """Identify existing objects using the mounted filesystem, not spelling."""
+    try:
+        info = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    return info.st_dev, info.st_ino
+
+
+def _ancestor_identity_route(
+    path: Path, directory_identity: tuple[int, int],
+) -> tuple[Path, Path] | None:
+    for ancestor in (path, *path.parents):
+        if _filesystem_identity(ancestor) == directory_identity:
+            return ancestor, path.relative_to(ancestor)
+    return None
+
+
+def _private_repository_route(path: Path, root: Path, root_identity: tuple[int, int]) -> bool:
+    route = _ancestor_identity_route(path, root_identity)
+    if route is None:
+        return False
+    ancestor, relative = route
+    private_parts = PRIVATE_STORAGE_DIRECTORY.parts
+    if len(relative.parts) <= len(private_parts):
+        raise RoomError("invalid_input")
+    actual, canonical = ancestor, root
+    for component, required in zip(relative.parts, private_parts):
+        actual, canonical = actual / component, canonical / required
+        # Case aliases are harmless when both paths identify the same directory.
+        # Symlink redirection of the protected prefixes remains forbidden.
+        if actual.is_symlink() or canonical.is_symlink():
+            raise RoomError("invalid_input")
+        actual_identity = _filesystem_identity(actual)
+        canonical_identity = _filesystem_identity(canonical)
+        if actual_identity is None and canonical_identity is None:
+            if component != required:
+                raise RoomError("invalid_input")
+        elif actual_identity != canonical_identity:
+            raise RoomError("invalid_input")
+    return True
+
+
+def _prospective_location(path: Path) -> tuple[tuple[int, int], tuple[str, ...]]:
+    for ancestor in (path, *path.parents):
+        identity = _filesystem_identity(ancestor)
+        if identity is not None:
+            # Conservatively reserve case aliases of not-yet-created application
+            # files as well. Existing directories are compared by device/inode.
+            return identity, tuple(part.casefold() for part in path.relative_to(ancestor).parts)
+    raise RoomError("invalid_input")
+
+
 class RoomStore:
     def __init__(self, path: str | Path, *, protected_paths: tuple[str | Path, ...] = ()):
         try:
@@ -260,42 +319,39 @@ class RoomStore:
     def _validate_path(self) -> None:
         try:
             root = REPOSITORY_ROOT.resolve()
-            private = root / PRIVATE_STORAGE_DIRECTORY
+            root_identity = _filesystem_identity(root)
+            if root_identity is None:
+                raise RoomError("invalid_input")
             if self._configured_path.resolve() != self.path:
                 raise RoomError("invalid_input")
             own_paths = (self.path, *(Path(str(self.path) + suffix) for suffix in _SQLITE_SIDECARS))
-            lexical_location = self._configured_path
-            if not lexical_location.is_relative_to(root):
-                # macOS /var -> /private/var and checkout aliases must not hide
-                # an in-repository path before a descendant symlink escapes.
-                for ancestor in lexical_location.parents:
-                    if ancestor.resolve() == root:
-                        lexical_location = root / lexical_location.relative_to(ancestor)
-                        break
-            lexical_paths = (lexical_location, *(Path(str(lexical_location) + suffix) for suffix in _SQLITE_SIDECARS))
+            lexical_paths = (self._configured_path, *(Path(str(self._configured_path) + suffix) for suffix in _SQLITE_SIDECARS))
             # A database must never occupy SQLite's reserved sidecar pathname,
             # even when that sidecar does not exist yet.
-            if self.path.name.endswith(_SQLITE_SIDECARS):
+            if self.path.name.casefold().endswith(_SQLITE_SIDECARS):
                 raise RoomError("database_collision")
+            locations = {}
+
+            def location(path: Path):
+                if path not in locations:
+                    locations[path] = _prospective_location(path)
+                return locations[path]
+
             for protected in self.protected_paths:
                 for other in (protected, *(Path(str(protected) + suffix) for suffix in _SQLITE_SIDECARS)):
                     other = other.expanduser().resolve()
                     for candidate in own_paths:
                         candidate = candidate.resolve()
-                        if candidate == other:
+                        if candidate == other or location(candidate) == location(other):
                             raise RoomError("database_collision")
                         if candidate.exists() and other.exists() and os.path.samefile(candidate, other):
                             raise RoomError("database_collision")
             for candidate in (*lexical_paths, *own_paths):
                 resolved = candidate.resolve()
-                for location in (candidate, resolved):
-                    if location.is_relative_to(root):
-                        if not location.is_relative_to(private) or location == private:
-                            raise RoomError("invalid_input")
-                        # The private directory itself must not redirect storage
-                        # elsewhere, even when its symlink target is also in Git.
-                        if private.resolve() != private or not resolved.is_relative_to(private):
-                            raise RoomError("invalid_input")
+                lexical_inside = _private_repository_route(candidate, root, root_identity)
+                resolved_inside = _private_repository_route(resolved, root, root_identity)
+                if lexical_inside and not resolved_inside:
+                    raise RoomError("invalid_input")
                 if candidate.exists() and candidate.stat().st_nlink > 1:
                     raise RoomError("database_collision")
             if self.path.name in {":memory:", ""} or self.path.is_dir():
@@ -306,21 +362,62 @@ class RoomStore:
             raise RoomError("invalid_input") from None
 
     @contextmanager
-    def _connection(self, *, initializing: bool = False):
-        self._validate_path()
-        conn = None
+    def _connection(self, *, initializing: bool = False, newly_created: bool = False):
+        with _STORAGE_LOCK:
+            self._validate_path()
+            conn = None
+            try:
+                self._preflight_existing(allow_empty=newly_created)
+                conn = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True, timeout=5, isolation_level=None)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA foreign_keys=ON")
+                if not initializing:
+                    self._check_schema(conn)
+                yield conn
+            except (sqlite3.Error, OSError, ValueError):
+                raise RoomError("storage_failure") from None
+            finally:
+                if conn is not None:
+                    conn.close()
+
+    def _preflight_existing(self, *, allow_empty: bool = False) -> None:
+        """Validate committed state without SQLite ever opening the originals.
+
+        Even a read-only SQLite connection can create or alter shared memory.
+        Recover WAL/rollback state only in a private disposable copy instead.
+        The process lock excludes our own writers while these files are copied;
+        an independent filesystem writer remains outside that deployment model.
+        """
+        if not self.path.exists():
+            return
         try:
-            conn = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True, timeout=5, isolation_level=None)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA foreign_keys=ON")
-            if not initializing:
-                self._check_schema(conn)
-            yield conn
+            with tempfile.TemporaryDirectory(prefix="room-schema-preflight-") as temporary:
+                snapshot = Path(temporary) / "room.sqlite3"
+                # SHM is a derived WAL index, not committed data. Rebuild it only
+                # in the snapshot; do not open or modify the original SHM file.
+                for suffix in ("", "-wal", "-journal"):
+                    source = Path(str(self.path) + suffix)
+                    if suffix and not source.exists():
+                        continue
+                    destination = Path(str(snapshot) + suffix)
+                    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(descriptor, "wb") as target, source.open("rb") as original:
+                        shutil.copyfileobj(original, target)
+                conn = sqlite3.connect(snapshot.as_uri() + "?mode=rw", uri=True, isolation_level=None)
+                try:
+                    if (
+                        conn.execute("PRAGMA application_id").fetchone()[0] == 0
+                        and conn.execute("PRAGMA user_version").fetchone()[0] == 0
+                        and not conn.execute("SELECT name FROM sqlite_master").fetchall()
+                    ):
+                        if allow_empty:
+                            return
+                        raise RoomError("schema_mismatch")
+                    self._check_schema(conn)
+                finally:
+                    conn.close()
         except (sqlite3.Error, OSError, ValueError):
-            raise RoomError("storage_failure") from None
-        finally:
-            if conn is not None:
-                conn.close()
+            raise RoomError("schema_mismatch") from None
 
     @staticmethod
     def _check_schema(conn: sqlite3.Connection) -> None:
@@ -332,16 +429,22 @@ class RoomStore:
             raise RoomError("schema_mismatch")
 
     def initialize(self) -> None:
+        with _STORAGE_LOCK:
+            self._initialize_locked()
+
+    def _initialize_locked(self) -> None:
         self._validate_path()
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            newly_created = False
             try:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             except FileExistsError:
                 pass
             else:
                 os.close(fd)
-            with self._connection(initializing=True) as conn:
+                newly_created = True
+            with self._connection(initializing=True, newly_created=newly_created) as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     app_id = conn.execute("PRAGMA application_id").fetchone()[0]

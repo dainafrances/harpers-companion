@@ -83,6 +83,31 @@ already-working ordinary global command definitions. Its failure cannot undo or
 interrupt commands that were already operating. Command availability never grants
 entry access; the exact owner/route checks still apply on every invocation.
 
+Owner, channel and guild restrictions protect execution and content; they do not
+necessarily hide slash-command names. Guild Room names may be discoverable
+throughout the configured guild, subject to Discord permissions. DM Room commands
+use application-global definitions with bot-DM context, while local execution
+checks restrict them to the configured owner's exact one-to-one DM route.
+
+After a previously enabled installation restarts with the Room disabled, local
+Room callbacks are absent. Remote definitions outside the next ordinary bulk-sync
+scope may remain published. Given a successful ordinary sync, the transition is:
+
+| Previously published Room definitions | Next ordinary sync | Result |
+| --- | --- | --- |
+| DM/global definitions | Guild-only sync | Remote Room definitions remain. |
+| DM/global definitions | Global bulk sync | Ordinary sync removes the stale global definitions. |
+| Guild definitions in an ordinary configured guild | Bulk sync to that guild | Ordinary sync removes the stale guild definitions. |
+| Guild definitions in a separate Room guild | Bulk sync to other configured guilds | Remote Room definitions remain in the separate guild. |
+
+Any surviving stale definition has no local callback. Its invocation fails closed
+with `CommandNotFound` before provider or Room-storage access; Discord may show an
+unanswered command rather than a Room-specific disabled acknowledgement. This is
+not an executable Room operation or an entry disclosure. The feature-disabled
+guarantee is no local Room registration, no Room publication/sync attempt and no
+executable Room operation, rather than immediate remote-definition removal.
+Phase 1 implements no remote command deletion.
+
 ## Persistence and schema version
 
 The dedicated database defaults to
@@ -101,6 +126,23 @@ ignore patterns. Traversal attempts, symlink escapes and paths whose SQLite
 sidecars leave the protected directory are rejected before provider invocation or
 private-data creation. Invalid old custom paths fail closed rather than being
 silently moved or adopted.
+
+Containment is based on device/inode identity of existing filesystem components,
+including the nearest existing ancestors, rather than spelling or
+`Path.resolve()` alone. A path physically in the repository root or any other
+unprotected directory is rejected even through a case-insensitive alias. A harmless alternate-case
+spelling of the same physical protected directory is accepted, including through
+alternate-case intermediate components. Reserved SQLite sidecar suffixes
+`-wal`, `-shm` and `-journal` are checked case-insensitively when choosing a
+database name. Existing traversal, symlink, hardlink and collision protections
+still apply.
+
+The intended deployment is one service on a fixed private volume. A process-level
+lock serializes validation and Room connections, including worker-thread writes.
+There remains a check/open race against a separate process able to replace
+filesystem components concurrently. That hostile-writer case is outside the
+intended single-service boundary; it does not require a larger filesystem
+security design in Phase 1.
 
 The old default `data/room_of_becoming.sqlite3` is not discovered automatically
 by the new default. An existing installation requires operator confirmation of
@@ -121,6 +163,24 @@ but ineffective immutability trigger. A valid database initializes idempotently.
 Rejection does not silently repair, migrate, recreate or overwrite definitions,
 bytes or stored user data. Future schema upgrades require an explicit migration
 rather than relying only on `CREATE TABLE IF NOT EXISTS`.
+
+For an existing database, preflight validates a private disposable external
+snapshot before any writable connection to the original. Copy the main database
+and any present WAL or rollback journal; do not copy or alter the original SHM.
+SQLite may rebuild an index or recover the snapshot, so preflight sees complete
+committed state, including schema changes outstanding in WAL. Do not use
+immutable mode to ignore those committed changes. Validation copies are cleaned
+up and remain private while they exist.
+
+An altered same-version schema returns bounded `schema_mismatch` without opening
+the original writable, changing its database/WAL/SHM/journal bytes or existence
+states, changing logical records, creating a receipt/entry, or claiming success.
+Successful preflight permits normal writable initialization. A new database may
+be created normally, and valid existing WAL databases remain usable with
+idempotent initialization. No altered database is silently repaired or migrated.
+An existing empty unmarked database is also rejected. Permission to write an
+initial schema comes from successful exclusive creation in the current call,
+rather than from an existing file appearing empty after WAL recovery.
 
 The separate tables are `invocations`, `entries` and `revisions`:
 
@@ -294,6 +354,9 @@ Automated tests must cover at least:
 16. Optional Room definitions never enter the initial legacy sync. Disabled/invalid configuration adds none. Guild-only and DM/global paths, initial legacy rejection, Room-only rejection, reconnect retries and successful reconnects preserve ordinary commands and single timer starts.
 17. Actual provider SDK exceptions with mock HTTP transport retain only allowlisted structured error metadata and still produce no entry.
 18. Same-named no-op update/delete triggers, changed table/index definitions, missing objects and unexpected objects are rejected without changing existing database bytes/data. Valid initialization remains repeatable, and older revisions remain immutable through normal APIs.
+19. Filesystem-identity checks reject actual writes through alternate-case aliases of unprotected repository locations, accept case aliases of the physical protected directory, and reject upper/mixed-case sidecar suffixes. Case-alias tests execute on the current case-insensitive host.
+20. Preflight rejects a committed schema alteration still outstanding in WAL before any writable original connection. Independent hashes/existence checks cover the original database, WAL, SHM and journal; independent SQL confirms committed records remain. Valid WAL, rollback-journal rejection and fresh creation are covered.
+21. Stateful enabled-to-disabled restart tests preserve simulated remote definitions across separate startup fixtures in all four transition scopes above. They verify retention/removal, absent callbacks, actual Discord dispatch failing closed, no provider/storage access, no disabled Room registration/sync and operational ordinary commands/timers.
 
 For accepted repairs, run Room tests, the full suite, the shuffled full suite,
 `compileall`, `pip check`, whitespace/diff checks and each original adversarial

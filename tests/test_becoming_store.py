@@ -309,6 +309,108 @@ class PrivatePathTests(unittest.TestCase):
                 self.assertTrue(path.is_file())
                 self.assertTrue(store.path.is_relative_to(self.private))
 
+    def case_alias(self, path):
+        alias = path.with_name(path.name.swapcase())
+        if not alias.exists() or not os.path.samefile(alias, path):
+            self.skipTest("Case aliases require a case-insensitive test filesystem")
+        return alias
+
+    def test_repository_case_alias_write_is_rejected_before_sqlite_or_provider(self):
+        alias = self.case_alias(self.root)
+        candidate = alias / "private-room.sqlite3"
+        model = AsyncMock(return_value=result())
+
+        async def attempted_write():
+            service = room.RoomService(room.RoomStore(candidate), model, "synthetic-model")
+            return await service.create(SCOPE, "synthetic-case-alias")
+
+        with patch.object(room.sqlite3, "connect", wraps=sqlite3.connect) as connect:
+            with self.assertRaisesRegex(room.RoomError, "invalid_input"):
+                asyncio.run(attempted_write())
+            connect.assert_not_called()
+        model.assert_not_awaited()
+        self.assertFalse(candidate.exists())
+        self.assertEqual(list(self.root.rglob("*")), [])
+
+    def test_existing_protected_case_aliases_are_allowed_by_filesystem_identity(self):
+        self.private.mkdir(parents=True)
+        nested = self.private / "nested"
+        nested.mkdir()
+        root_alias = self.case_alias(self.root)
+        data_alias = self.case_alias(self.private.parent)
+        private_alias = self.case_alias(self.private)
+        nested_alias = self.case_alias(nested)
+        candidates = (
+            root_alias / room.PRIVATE_STORAGE_DIRECTORY / "root-case.sqlite3",
+            data_alias / self.private.name / "intermediate-case.sqlite3",
+            private_alias / "private-case.sqlite3",
+            root_alias / self.private.parent.name.upper() / self.private.name.upper() / "combined-case.sqlite3",
+            nested_alias / "nested-case.sqlite3",
+        )
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                store = room.RoomStore(candidate)
+                store.initialize()
+                canonical = (nested if candidate.parent.name.casefold() == "nested" else self.private) / candidate.name
+                self.assertTrue(canonical.exists())
+                self.assertTrue(os.path.samefile(store.path, canonical))
+
+    def test_case_alias_of_unprotected_intermediate_directory_is_rejected(self):
+        unprotected = self.root / "data" / "nested"
+        unprotected.mkdir(parents=True)
+        alias = self.case_alias(unprotected)
+        with self.assertRaisesRegex(room.RoomError, "invalid_input"):
+            room.RoomStore(alias / "room.sqlite3")
+        self.assertEqual(list(unprotected.iterdir()), [])
+
+    def test_uppercase_and_mixed_case_reserved_sidecar_suffixes_are_rejected(self):
+        for suffix in ("-WAL", "-WaL", "-SHM", "-sHm", "-JOURNAL", "-JoUrNaL"):
+            with self.subTest(suffix=suffix):
+                candidate = self.private / ("room.sqlite3" + suffix)
+                with patch.object(room.sqlite3, "connect", wraps=sqlite3.connect) as connect:
+                    with self.assertRaisesRegex(room.RoomError, "database_collision"):
+                        room.RoomStore(candidate)
+                    connect.assert_not_called()
+                self.assertFalse(candidate.exists())
+        self.assertEqual(list(self.root.rglob("*")), [])
+
+    def test_case_aliased_sqlite_sidecar_escape_is_rejected(self):
+        self.private.mkdir(parents=True)
+        alias = self.case_alias(self.private)
+        candidate = alias / "room.sqlite3"
+        for suffix in ("-WaL", "-ShM", "-JoUrNaL"):
+            with self.subTest(suffix=suffix):
+                target = Path(self.temp.name).resolve() / ("outside" + suffix)
+                sidecar = Path(str(candidate) + suffix)
+                sidecar.symlink_to(target)
+                try:
+                    with self.assertRaisesRegex(room.RoomError, "invalid_input"):
+                        room.RoomStore(candidate)
+                    self.assertFalse(candidate.exists())
+                    self.assertFalse(target.exists())
+                finally:
+                    sidecar.unlink()
+
+    def test_nonexistent_application_file_case_alias_collision_is_rejected(self):
+        external = Path(self.temp.name).resolve() / "external"
+        external.mkdir()
+        alias = self.case_alias(external)
+        protected = external / "legacy.sqlite3"
+        candidate = alias / "LEGACY.SQLITE3"
+        with self.assertRaisesRegex(room.RoomError, "database_collision"):
+            room.RoomStore(candidate, protected_paths=(protected,))
+        self.assertFalse(protected.exists())
+        self.assertFalse(candidate.exists())
+
+    def test_external_directory_case_alias_remains_supported(self):
+        external = Path(self.temp.name).resolve() / "external"
+        external.mkdir()
+        alias = self.case_alias(external)
+        store = room.RoomStore(alias / "room.sqlite3")
+        store.initialize()
+        self.assertTrue(os.path.samefile(store.path, external / "room.sqlite3"))
+        self.assertEqual(list(self.root.rglob("*")), [])
+
     def test_other_in_repository_paths_are_rejected_before_creation(self):
         candidates = (
             self.root / "private-room.sqlite3",
