@@ -1,0 +1,79 @@
+name: Room Linux Python 3.13
+
+on:
+  push:
+    branches: [main, codex/room-of-becoming-phase1]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  synthetic-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHON_DOTENV_DISABLED: "1"
+      DISCORD_TOKEN: synthetic-ci-token
+      OPENROUTER_API_KEY: synthetic-ci-key
+      BECOMING_ENABLED: "false"
+      BECOMING_BACKUP_ENABLED: "false"
+      AWS_EC2_METADATA_DISABLED: "true"
+      BECOMING_TEST_REFERENCE_AGE: /usr/bin/age
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+      - name: Install requirements and reference age
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip check
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends age
+          test -x "$BECOMING_TEST_REFERENCE_AGE"
+          "$BECOMING_TEST_REFERENCE_AGE" --version
+      - name: Import Linux backup dependencies
+        run: python -c "import pyrage, boto3, botocore; print('Backup dependency imports passed')"
+      - name: Block external network during synthetic tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/room-test-guard"
+          cat > "$RUNNER_TEMP/room-test-guard/sitecustomize.py" <<'PY'
+          import ipaddress
+          import socket
+          import sys
+
+          def local(host):
+              if host == "localhost":
+                  return True
+              try:
+                  return ipaddress.ip_address(host).is_loopback
+              except ValueError:
+                  return False
+
+          def guard(event, args):
+              if event == "socket.getaddrinfo" and not local(args[0]):
+                  raise OSError("External network disabled for synthetic tests")
+              if event == "socket.connect":
+                  sock, address = args
+                  if sock.family in (socket.AF_INET, socket.AF_INET6) and not local(address[0]):
+                      raise OSError("External network disabled for synthetic tests")
+
+          sys.addaudithook(guard)
+          PY
+          printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'PYTHONPATH=%s/room-test-guard\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Independent age encryption interoperability
+        run: python -B -m unittest tests.test_becoming_backup_transport.ReferenceAgeInteroperabilityTests -v
+      - name: All Room tests
+        run: python -B -m unittest discover -s tests -p 'test_becoming*.py' -v
+      - name: Full repository suite
+        run: python -B -m unittest discover -s tests -p 'test_*.py' -v
