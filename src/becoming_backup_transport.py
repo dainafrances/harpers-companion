@@ -25,10 +25,10 @@ _NAME = re.compile(r"([0-9]{8}T[0-9]{6}Z)-([0-9a-f-]{16,64})\.tar\.age\Z")
 _CHUNK = 65536
 
 
-def _error(category: str):
+def _error(category: str, **fields):
     # Core imports this module, so resolve the bounded application error lazily.
     from .becoming_backup import BackupError
-    return BackupError(category)
+    return BackupError(category, **fields)
 
 
 def _check_time(deadline: float) -> None:
@@ -37,9 +37,80 @@ def _check_time(deadline: float) -> None:
 
 
 def _utc(value: object) -> datetime:
-    if not isinstance(value, datetime) or value.tzinfo is None:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise _error("retention_mismatch")
     return value.astimezone(timezone.utc)
+
+
+def _bounded_error(error: BaseException, fallback: str):
+    from .becoming_backup import BackupError
+    if isinstance(error, BackupError):
+        return _error(error.category, cleanup_failed=error.cleanup_failed,
+                      verification_reason=error.verification_reason,
+                      remote_uploaded=error.remote_uploaded)
+    if type(error).__name__ == "CancelledError":
+        return _error("cancelled")
+    if "timeout" in type(error).__name__.lower():
+        return _error("timeout")
+    if type(error).__name__ == "IncompleteReadError":
+        return _error("download_size_mismatch")
+    return _error(fallback)
+
+
+def _cleanup_failed(primary=None):
+    if primary is None:
+        return _error("cleanup_failure", cleanup_failed=True)
+    return _error(
+        primary.category, cleanup_failed=True,
+        verification_reason=getattr(primary, "verification_reason", None),
+        remote_uploaded=getattr(primary, "remote_uploaded", False),
+    )
+
+
+def _remote_error(primary, stage: str):
+    if primary.category == "remote_unverified":
+        return primary
+    reasons = {
+        "metadata_mismatch": "metadata_mismatch",
+        "retention_mismatch": "retention_mismatch",
+        "retention_too_short": "retention_too_short",
+        "download_size_mismatch": "length_mismatch",
+        "download_hash_mismatch": "hash_mismatch",
+        "cleanup_failure": "verification_cleanup_failure",
+        "cancelled": "cancelled",
+    }
+    reason = reasons.get(primary.category)
+    if reason is None:
+        if primary.category == "timeout":
+            reason = "download_timeout" if stage == "download" else "verification_timeout"
+        else:
+            reason = "download_failure" if stage == "download" else "storage_unavailable"
+    return _error(
+        "remote_unverified", verification_reason=reason, remote_uploaded=True,
+        cleanup_failed=getattr(primary, "cleanup_failed", False),
+    )
+
+
+def _clean_verification_directory(directory: Path | None) -> bool:
+    """Attempt every owned cleanup independently; never expose OS diagnostics."""
+    if directory is None:
+        return False
+    failed = False
+    try:
+        children = list(directory.iterdir())
+    except BaseException:
+        children = []
+        failed = True
+    for child in children:
+        try:
+            child.unlink(missing_ok=True)
+        except BaseException:
+            failed = True
+    try:
+        directory.rmdir()
+    except BaseException:
+        failed = True
+    return failed
 
 
 def _bounded_metadata(value: object) -> dict[str, str]:
@@ -191,19 +262,41 @@ class B2Transport:
 
     def _call(self, method: str, deadline: float, **kwargs):
         _check_time(deadline)
+        primary = None
         try:
             result = getattr(self.client, method)(**kwargs)
-        except Exception as exc:
-            # Neither provider error bodies nor their possibly sensitive request
-            # fields cross this boundary.
-            raise _error(_exception_category(exc)) from None
-        _check_time(deadline)
-        if not isinstance(result, dict):
-            raise _error("storage_unavailable")
+        except BaseException as exc:
+            # Neither provider messages nor possibly sensitive request fields
+            # cross this boundary. A failed PUT is not a confirmed upload.
+            if isinstance(exc, Exception):
+                primary = _error(_exception_category(exc))
+            else:
+                primary = _bounded_error(exc, "storage_unavailable")
+        if primary is not None:
+            raise primary from None
+        primary = None
+        try:
+            _check_time(deadline)
+            if not isinstance(result, dict):
+                raise _error("storage_unavailable")
+        except BaseException as exc:
+            primary = _bounded_error(exc, "storage_unavailable")
+        if primary is not None:
+            # GET ownership begins as soon as the SDK returns, before the
+            # wrapper's post-call deadline can raise.
+            body = result.get("Body") if isinstance(result, dict) else None
+            if body is not None:
+                try:
+                    body.close()
+                except BaseException:
+                    primary = _cleanup_failed(primary)
+            if method == "put_object":
+                primary = _remote_error(primary, "verification")
+            raise primary from None
         return result
 
     def _retention(self, key: str, deadline: float, *, version: str | None = None,
-                   expected: datetime | None = None) -> None:
+                   expected: datetime | None = None, minimum_days: int | None = None) -> datetime:
         kwargs = {"Bucket": self.config.bucket, "Key": key}
         if version:
             kwargs["VersionId"] = version
@@ -212,8 +305,11 @@ class B2Transport:
         if not isinstance(retention, Mapping) or retention.get("Mode") != "COMPLIANCE":
             raise _error("retention_mismatch")
         until = _utc(retention.get("RetainUntilDate"))
+        if minimum_days is not None and until < _utc(self.clock()) + timedelta(days=minimum_days):
+            raise _error("retention_too_short")
         if expected is not None and until < expected:
             raise _error("retention_mismatch")
+        return until
 
     def _readiness(self, deadline: float) -> dict[str, bool]:
         self._call("head_bucket", deadline, Bucket=self.config.bucket)
@@ -258,22 +354,28 @@ class B2Transport:
         kwargs = {"Bucket": self.config.bucket, "Key": key}
         if version:
             kwargs["VersionId"] = version
-        response = self._call("get_object", deadline, **kwargs)
-        body = response.get("Body")
+        body = None
         pending: Path | None = None
+        descriptor = None
+        primary = None
+        published = False
         try:
+            response = self._call("get_object", deadline, **kwargs)
+            body = response.get("Body")
             if type(response.get("ContentLength")) is not int or response["ContentLength"] != size:
                 raise _error("download_size_mismatch")
             if response.get("Metadata") != metadata:
                 raise _error("metadata_mismatch")
             if body is None:
                 raise _error("download_size_mismatch")
-            fd, name = tempfile.mkstemp(prefix=".ciphertext-", suffix=".pending", dir=destination.parent)
+            descriptor, name = tempfile.mkstemp(prefix=".ciphertext-", suffix=".pending", dir=destination.parent)
             pending = Path(name)
-            os.fchmod(fd, 0o600)
             count = 0
             digest = hashlib.sha256()
-            with os.fdopen(fd, "wb") as stream:
+            stream = os.fdopen(descriptor, "wb")
+            descriptor = None
+            with stream:
+                os.fchmod(stream.fileno(), 0o600)
                 while True:
                     _check_time(deadline)
                     chunk = body.read(_CHUNK)
@@ -293,80 +395,132 @@ class B2Transport:
             if digest.hexdigest() != metadata["ciphertext_sha256"]:
                 raise _error("download_hash_mismatch")
             _check_time(deadline)
-            # Hard-link publication never replaces an existing destination,
-            # including one appearing after the initial existence check.
-            os.link(pending, destination)
-        except Exception as exc:
-            from .becoming_backup import BackupError
-            if isinstance(exc, BackupError):
-                raise
-            if isinstance(exc, FileExistsError):
-                raise _error("destination_exists") from None
-            category = "timeout" if "timeout" in type(exc).__name__.lower() else "download_failure"
-            raise _error(category) from None
+        except BaseException as exc:
+            primary = _bounded_error(exc, "download_failure")
         finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    primary = _cleanup_failed(primary)
             if body is not None:
                 try:
                     body.close()
-                except Exception:
-                    pass
-            if pending is not None:
+                except BaseException:
+                    primary = _cleanup_failed(primary)
+        # Close the remote response before publishing any verification file.
+        if primary is None:
+            try:
+                _check_time(deadline)
+                os.link(pending, destination)
+                published = True
+            except BaseException as exc:
+                primary = _error("destination_exists") if isinstance(exc, FileExistsError) else _bounded_error(exc, "download_failure")
+        if pending is not None:
+            try:
                 pending.unlink(missing_ok=True)
+            except BaseException:
+                primary = _cleanup_failed(primary)
+        if primary is None:
+            try:
+                _check_time(deadline)
+            except BaseException as exc:
+                primary = _bounded_error(exc, "download_failure")
+        if primary is not None and published:
+            try:
+                destination.unlink(missing_ok=True)
+            except BaseException:
+                primary = _cleanup_failed(primary)
+        if primary is not None:
+            raise primary from None
 
     def upload_and_verify(self, ciphertext_path: str | Path, *, key: str,
                           metadata: Mapping[str, str], retain_until: datetime,
                           deadline: float | None = None) -> dict[str, Any]:
-        tier, created, backup_id = self._key(key)
-        metadata = _bounded_metadata(metadata)
-        until = _utc(retain_until)
-        if metadata["tier"] != tier or metadata["backup_id"] != backup_id:
-            raise _error("metadata_mismatch")
-        if until < max(created, _utc(self.clock())) + timedelta(days=TIER_DAYS[tier]):
-            raise _error("retention_mismatch")
-        path = Path(ciphertext_path)
-        if not path.is_file() or path.is_symlink():
-            raise _error("ciphertext_invalid")
-        size = path.stat().st_size
-        maximum = int(self.config.max_plaintext_bytes) + 1048576
-        if not 0 < size <= maximum:
-            raise _error("ciphertext_invalid")
-        deadline = min(self._deadline(), deadline) if deadline is not None else self._deadline()
-        sha = hashlib.sha256()
-        md5 = hashlib.md5(usedforsecurity=False)
-        with path.open("rb") as source:
-            while chunk := source.read(_CHUNK):
+        remote_uploaded = False
+        directory = None
+        primary = None
+        stage = "verification"
+        result = None
+        try:
+            tier, created, backup_id = self._key(key)
+            metadata = _bounded_metadata(metadata)
+            requested_lower_bound = _utc(retain_until)
+            if metadata["tier"] != tier or metadata["backup_id"] != backup_id:
+                raise _error("metadata_mismatch")
+            path = Path(ciphertext_path)
+            if not path.is_file() or path.is_symlink():
+                raise _error("ciphertext_invalid")
+            size = path.stat().st_size
+            maximum = int(self.config.max_plaintext_bytes) + 1048576
+            if not 0 < size <= maximum:
+                raise _error("ciphertext_invalid")
+            deadline = min(self._deadline(), deadline) if deadline is not None else self._deadline()
+            sha = hashlib.sha256()
+            md5 = hashlib.md5(usedforsecurity=False)
+            with path.open("rb") as source:
+                while chunk := source.read(_CHUNK):
+                    _check_time(deadline)
+                    sha.update(chunk)
+                    md5.update(chunk)
+            if sha.hexdigest() != metadata["ciphertext_sha256"]:
+                raise _error("metadata_mismatch")
+            self._readiness(deadline)
+            with path.open("rb") as source:
                 _check_time(deadline)
-                sha.update(chunk)
-                md5.update(chunk)
-        if sha.hexdigest() != metadata["ciphertext_sha256"]:
-            raise _error("metadata_mismatch")
-        self._readiness(deadline)
-        with path.open("rb") as source:
-            uploaded = self._call(
-                "put_object", deadline, Bucket=self.config.bucket, Key=key, Body=_UploadReader(source, deadline),
-                ContentLength=size, ContentType="application/octet-stream", Metadata=metadata,
-                ContentMD5=base64.b64encode(md5.digest()).decode("ascii"),
-                ObjectLockMode="COMPLIANCE", ObjectLockRetainUntilDate=until,
-            )
-        version = uploaded.get("VersionId")
-        if version is not None and (not isinstance(version, str) or not 0 < len(version) <= 1024):
-            raise _error("metadata_mismatch")
-        kwargs = {"Bucket": self.config.bucket, "Key": key}
-        if version:
-            kwargs["VersionId"] = version
-        head = self._call("head_object", deadline, **kwargs)
-        if type(head.get("ContentLength")) is not int or head["ContentLength"] != size:
-            raise _error("download_size_mismatch")
-        if head.get("Metadata") != metadata or head.get("ContentType") != "application/octet-stream":
-            raise _error("metadata_mismatch")
-        self._retention(key, deadline, version=version, expected=until)
-        with tempfile.TemporaryDirectory(prefix="room-ciphertext-verify-", dir=path.parent) as directory:
+                # The complete operation timeout is a conservative bounded
+                # margin covering every remaining within-budget transfer and
+                # verification step. A caller's date can only raise this floor.
+                until = max(requested_lower_bound, max(created, _utc(self.clock())) + timedelta(
+                    days=TIER_DAYS[tier], seconds=float(self.config.timeout_seconds)))
+                uploaded = self._call(
+                    "put_object", deadline, Bucket=self.config.bucket, Key=key, Body=_UploadReader(source, deadline),
+                    ContentLength=size, ContentType="application/octet-stream", Metadata=metadata,
+                    ContentMD5=base64.b64encode(md5.digest()).decode("ascii"),
+                    ObjectLockMode="COMPLIANCE", ObjectLockRetainUntilDate=until,
+                )
+                remote_uploaded = True
+            version = uploaded.get("VersionId")
+            if version is not None and (not isinstance(version, str) or not 0 < len(version) <= 1024):
+                raise _error("metadata_mismatch")
+            kwargs = {"Bucket": self.config.bucket, "Key": key}
+            if version:
+                kwargs["VersionId"] = version
+            head = self._call("head_object", deadline, **kwargs)
+            if type(head.get("ContentLength")) is not int or head["ContentLength"] != size:
+                raise _error("download_size_mismatch")
+            if head.get("Metadata") != metadata or head.get("ContentType") != "application/octet-stream":
+                raise _error("metadata_mismatch")
+            retained_until = self._retention(key, deadline, version=version, expected=until, minimum_days=TIER_DAYS[tier])
+            directory = Path(tempfile.mkdtemp(prefix="room-ciphertext-verify-", dir=path.parent))
             os.chmod(directory, 0o700)
-            self._download(key, Path(directory) / "verified.tar.age", metadata, size, deadline, version=version)
-        return {
-            "ciphertext_size": size, "ciphertext_sha256": sha.hexdigest(),
-            "retention_verified": True, "download_verified": True,
-        }
+            stage = "download"
+            self._download(key, directory / "verified.tar.age", metadata, size, deadline, version=version)
+            stage = "verification"
+            _check_time(deadline)
+            if retained_until < _utc(self.clock()) + timedelta(days=TIER_DAYS[tier]):
+                raise _error("retention_too_short")
+            result = {
+                "ciphertext_size": size, "ciphertext_sha256": sha.hexdigest(),
+                "retention_verified": True, "download_verified": True,
+            }
+        except BaseException as exc:
+            primary = _bounded_error(exc, "storage_unavailable")
+        finally:
+            if _clean_verification_directory(directory):
+                primary = _cleanup_failed(primary)
+        if primary is None:
+            try:
+                _check_time(deadline)
+                if retained_until < _utc(self.clock()) + timedelta(days=TIER_DAYS[tier]):
+                    raise _error("retention_too_short")
+            except BaseException as exc:
+                primary = _bounded_error(exc, "storage_unavailable")
+        if primary is not None:
+            if remote_uploaded or getattr(primary, "remote_uploaded", False):
+                primary = _remote_error(primary, stage)
+            raise primary from None
+        return result
 
     def download_for_restore(self, key: str, destination_path: str | Path, *,
                              deadline: float | None = None) -> dict[str, Any]:

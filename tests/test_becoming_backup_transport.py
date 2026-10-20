@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import asyncio
 import hashlib
 import io
 import os
@@ -10,6 +11,8 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
+
+from botocore.response import StreamingBody
 from unittest.mock import patch
 
 from src.becoming_backup import BackupError
@@ -153,6 +156,14 @@ class TransportTests(unittest.TestCase):
             operation()
         self.assertEqual(caught.exception.category, category)
         self.assertNotIn("PRIVATE", str(caught.exception))
+        self.assertNotIn(str(self.path.parent), repr(caught.exception))
+        return caught.exception
+
+    def assert_remote(self, reason, operation=None):
+        error = self.assert_category("remote_unverified", operation or self.upload)
+        self.assertTrue(error.remote_uploaded)
+        self.assertEqual(error.verification_reason, reason)
+        return error
 
     def test_explicit_client_configuration_never_uses_environment_credentials(self):
         with patch("boto3.client", return_value=self.fake) as factory:
@@ -190,7 +201,7 @@ class TransportTests(unittest.TestCase):
                 self.assertTrue(result["retention_verified"] and result["download_verified"])
                 put = next(kwargs for method, kwargs in self.fake.calls if method == "put_object")
                 self.assertEqual(put["ObjectLockMode"], "COMPLIANCE")
-                self.assertEqual(put["ObjectLockRetainUntilDate"], NOW + timedelta(days=days))
+                self.assertEqual(put["ObjectLockRetainUntilDate"], NOW + timedelta(days=days, seconds=60))
                 self.assertEqual(put["ContentType"], "application/octet-stream")
                 self.assertTrue(put["ContentMD5"])
                 for method, kwargs in self.fake.calls:
@@ -216,7 +227,10 @@ class TransportTests(unittest.TestCase):
         for stage in ("head_bucket", "get_object_lock_configuration", "list_objects_v2", "put_object", "head_object", "get_object_retention", "get_object"):
             with self.subTest(stage=stage):
                 self.fake.fail = stage
-                self.assert_category("storage_unavailable", self.upload)
+                if stage in {"head_object", "get_object_retention", "get_object"}:
+                    self.assert_remote("download_failure" if stage == "get_object" else "storage_unavailable")
+                else:
+                    self.assert_category("storage_unavailable", self.upload)
                 self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 
     def test_timeout_is_bounded(self):
@@ -282,21 +296,21 @@ class TransportTests(unittest.TestCase):
 
     def test_partial_upload_rejected(self):
         self.fake.partial_put = True
-        self.assert_category("download_size_mismatch", self.upload)
+        self.assert_remote("length_mismatch")
 
     def test_head_metadata_mismatch_rejected(self):
         self.fake.head_changes = {"Metadata": {**metadata_for(), "ciphertext_sha256": "0" * 64}}
-        self.assert_category("metadata_mismatch", self.upload)
+        self.assert_remote("metadata_mismatch")
 
     def test_head_content_type_mismatch_rejected(self):
         self.fake.head_changes = {"ContentType": "text/plain"}
-        self.assert_category("metadata_mismatch", self.upload)
+        self.assert_remote("metadata_mismatch")
 
     def test_remote_retention_wrong_mode_or_shorter_date_rejected(self):
         for changes in ({"Mode": "GOVERNANCE"}, {"RetainUntilDate": NOW}, {"RetainUntilDate": "invalid"}):
             with self.subTest(changes=changes):
                 self.fake.retention_changes = changes
-                self.assert_category("retention_mismatch", self.upload)
+                self.assert_remote("retention_too_short" if changes.get("RetainUntilDate") == NOW else "retention_mismatch")
 
     def test_longer_remote_retention_is_accepted(self):
         self.fake.retention_changes = {"RetainUntilDate": NOW + timedelta(days=400)}
@@ -304,40 +318,43 @@ class TransportTests(unittest.TestCase):
 
     def test_requested_retention_cannot_weaken_any_fixed_minimum(self):
         for tier, days in TIER_DAYS.items():
-            self.assert_category("retention_mismatch", lambda: self.upload(tier, retain_until=NOW + timedelta(days=days, seconds=-1)))
-        self.assertFalse(self.fake.calls)
+            self.fake.calls.clear()
+            self.upload(tier, retain_until=NOW + timedelta(days=days, seconds=-1))
+            put = next(kwargs for method, kwargs in self.fake.calls if method == "put_object")
+            self.assertEqual(put["ObjectLockRetainUntilDate"], NOW + timedelta(days=days, seconds=60))
 
     def test_late_upload_uses_actual_upload_time_for_minimum(self):
         self.transport.clock = lambda: NOW + timedelta(days=2)
-        self.assert_category("retention_mismatch", self.upload)
-        self.assertFalse(self.fake.calls)
+        self.upload()
+        put = next(kwargs for method, kwargs in self.fake.calls if method == "put_object")
+        self.assertEqual(put["ObjectLockRetainUntilDate"], NOW + timedelta(days=32, seconds=60))
 
     def test_download_content_length_header_mismatch_rejected(self):
         self.fake.get_changes = {"ContentLength": len(CIPHERTEXT) - 1}
-        self.assert_category("download_size_mismatch", self.upload)
+        self.assert_remote("length_mismatch")
         self.assertTrue(self.fake.body.closed)
 
     def test_download_short_or_long_body_rejected_and_cleaned(self):
         for data in (CIPHERTEXT[:-1], CIPHERTEXT + b"x"):
             self.fake.download_bytes = data
-            self.assert_category("download_size_mismatch", self.upload)
+            self.assert_remote("length_mismatch")
             self.assertTrue(self.fake.body.closed)
             self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 
     def test_independent_download_sha_mismatch_rejected(self):
         self.fake.download_bytes = b"x" * len(CIPHERTEXT)
-        self.assert_category("download_hash_mismatch", self.upload)
+        self.assert_remote("hash_mismatch")
         self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 
     def test_timeout_after_partial_download_cleans_pending_and_closes_body(self):
         self.fake.fail_after_read = True
-        self.assert_category("timeout", self.upload)
+        self.assert_remote("download_timeout")
         self.assertTrue(self.fake.body.closed)
         self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 
     def test_get_metadata_mismatch_rejected(self):
         self.fake.get_changes = {"Metadata": {}}
-        self.assert_category("metadata_mismatch", self.upload)
+        self.assert_remote("metadata_mismatch")
 
     def test_scoped_listing_cannot_trigger_access_outside_prefix(self):
         self.fake.existing_key = "unrelated/private.sqlite3"
@@ -398,6 +415,311 @@ class TransportTests(unittest.TestCase):
         self.fake.head_changes = {"Metadata": {"title": "PRIVATE"}}
         self.assert_category("metadata_mismatch", lambda: self.transport.download_for_restore(key_for(), self.path.parent / "restore.age"))
         self.assertNotIn("get_object", [method for method, _ in self.fake.calls])
+
+
+    def install_streaming_body(self, data=CIPHERTEXT, *, raw=None, advance=None):
+        raw = io.BytesIO(data) if raw is None else raw
+        body = StreamingBody(raw, len(data))
+        close = body.close
+        body.close_calls = 0
+
+        def counted_close():
+            body.close_calls += 1
+            return close()
+
+        body.close = counted_close
+
+        def get_object(**kwargs):
+            self.fake._call("get_object", kwargs)
+            self.fake.body = body
+            if advance is not None:
+                advance()
+            return {"Metadata": dict(metadata_for()), "ContentLength": len(CIPHERTEXT), "Body": body}
+
+        self.fake.get_object = get_object
+        return body, raw
+
+    def test_readiness_delay_and_slow_put_preserve_every_full_minimum_near_budget(self):
+        for tier, days in TIER_DAYS.items():
+            with self.subTest(tier=tier):
+                self.fake = FakeS3()
+                elapsed = [0.0]
+                self.transport = B2Transport(configuration(timeout_seconds=180), client=self.fake,
+                                             clock=lambda: NOW + timedelta(seconds=elapsed[0]))
+                ordinary_call = self.fake._call
+                put = self.fake.put_object
+                get = self.fake.get_object
+                boundaries = {}
+
+                def delayed_readiness(method, kwargs):
+                    ordinary_call(method, kwargs)
+                    if method in {"head_bucket", "get_object_lock_configuration", "list_objects_v2"}:
+                        elapsed[0] += 25
+
+                def slow_put(**kwargs):
+                    boundaries["put"] = NOW + timedelta(seconds=elapsed[0])
+                    boundaries["until"] = kwargs["ObjectLockRetainUntilDate"]
+                    response = put(**kwargs)
+                    elapsed[0] += 60
+                    return response
+
+                def late_download(**kwargs):
+                    response = get(**kwargs)
+                    elapsed[0] += 40
+                    return response
+
+                self.fake._call = delayed_readiness
+                self.fake.put_object = slow_put
+                self.fake.get_object = late_download
+                with patch("src.becoming_backup_transport.time.monotonic", side_effect=lambda: elapsed[0]):
+                    result = self.upload(tier)
+                self.assertEqual(boundaries["put"], NOW + timedelta(seconds=75))
+                self.assertEqual(boundaries["until"], boundaries["put"] + timedelta(days=days, seconds=180))
+                self.assertEqual(elapsed[0], 175)
+                self.assertGreaterEqual(boundaries["until"], NOW + timedelta(seconds=elapsed[0], days=days))
+                self.assertTrue(result["retention_verified"] and result["download_verified"])
+
+    def test_returned_retention_short_at_inspection_is_remote_unverified(self):
+        elapsed = [0.0]
+        self.transport.clock = lambda: NOW + timedelta(seconds=elapsed[0])
+        ordinary = self.fake.get_object_retention
+
+        def shortened(**kwargs):
+            result = ordinary(**kwargs)
+            elapsed[0] = 20
+            result["Retention"]["RetainUntilDate"] = NOW + timedelta(days=30, seconds=19)
+            return result
+
+        self.fake.get_object_retention = shortened
+        with patch("src.becoming_backup_transport.time.monotonic", side_effect=lambda: elapsed[0]):
+            self.assert_remote("retention_too_short")
+        self.assertTrue(self.fake.objects)
+        self.assertNotIn("get_object", [method for method, _ in self.fake.calls])
+
+    def test_retention_shortened_but_above_full_minimum_is_retention_mismatch(self):
+        self.fake.retention_changes = {"RetainUntilDate": NOW + timedelta(days=30, seconds=59)}
+        self.assert_remote("retention_mismatch")
+
+    def test_naive_requested_or_upload_clock_is_rejected_without_put(self):
+        self.assert_category("retention_mismatch", lambda: self.upload(retain_until=NOW.replace(tzinfo=None)))
+        self.assertFalse(self.fake.calls)
+        self.transport.clock = lambda: NOW.replace(tzinfo=None)
+        self.assert_category("retention_mismatch", self.upload)
+        self.assertNotIn("put_object", [method for method, _ in self.fake.calls])
+
+    def test_timezone_aware_non_utc_retention_is_normalized(self):
+        requested = (NOW + timedelta(days=31)).astimezone(timezone(timedelta(hours=5)))
+        self.upload(retain_until=requested)
+        put = next(kwargs for method, kwargs in self.fake.calls if method == "put_object")
+        self.assertEqual(put["ObjectLockRetainUntilDate"], NOW + timedelta(days=31))
+        self.assertEqual(put["ObjectLockRetainUntilDate"].tzinfo, timezone.utc)
+
+    def test_post_put_deadline_is_remote_unverified_even_before_wrapper_returns(self):
+        elapsed = [0.0]
+        original = self.fake.put_object
+
+        def completed_late(**kwargs):
+            result = original(**kwargs)
+            elapsed[0] = 61
+            return result
+
+        self.fake.put_object = completed_late
+        with patch("src.becoming_backup_transport.time.monotonic", side_effect=lambda: elapsed[0]):
+            self.assert_remote("verification_timeout")
+        self.assertIn(key_for(), self.fake.objects)
+        self.assertNotIn("head_object", [method for method, _ in self.fake.calls])
+
+    def test_actual_streaming_body_closed_when_get_crosses_deadline_before_read(self):
+        self.upload()
+        elapsed = [0.0]
+        body, raw = self.install_streaming_body(advance=lambda: elapsed.__setitem__(0, 61))
+        destination = self.path.parent / "restored.age"
+        with patch("src.becoming_backup_transport.time.monotonic", side_effect=lambda: elapsed[0]):
+            self.assert_category("timeout", lambda: self.transport.download_for_restore(key_for(), destination))
+        self.assertTrue(raw.closed)
+        self.assertEqual(body.close_calls, 1)
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_post_get_deadline_after_put_is_remote_unverified_and_stream_closed(self):
+        elapsed = [0.0]
+        body, raw = self.install_streaming_body(advance=lambda: elapsed.__setitem__(0, 61))
+        with patch("src.becoming_backup_transport.time.monotonic", side_effect=lambda: elapsed[0]):
+            self.assert_remote("download_timeout")
+        self.assertTrue(raw.closed)
+        self.assertEqual(body.close_calls, 1)
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_actual_stream_closed_after_destination_open_failure(self):
+        body, raw = self.install_streaming_body()
+        with patch("src.becoming_backup_transport.tempfile.mkstemp", side_effect=PermissionError("PRIVATE PATH")):
+            self.assert_remote("download_failure")
+        self.assertTrue(raw.closed)
+        self.assertEqual(body.close_calls, 1)
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_actual_stream_closed_after_read_failure_timeout_or_cancellation(self):
+        for error, reason in ((OSError("PRIVATE PATH"), "download_failure"),
+                              (TimeoutError("PRIVATE TIMEOUT"), "download_timeout"),
+                              (asyncio.CancelledError("PRIVATE CANCEL"), "cancelled")):
+            with self.subTest(reason=reason):
+                class FailingRaw(io.BytesIO):
+                    def read(self, size=-1):
+                        raise error
+                body, raw = self.install_streaming_body(raw=FailingRaw(CIPHERTEXT))
+                self.assert_remote(reason)
+                self.assertTrue(raw.closed)
+                self.assertEqual(body.close_calls, 1)
+                self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_actual_stream_closed_after_hash_or_length_mismatch(self):
+        for data, reason in ((b"x" * len(CIPHERTEXT), "hash_mismatch"),
+                             (CIPHERTEXT[:-1], "length_mismatch"),
+                             (CIPHERTEXT + b"x", "length_mismatch")):
+            with self.subTest(reason=reason):
+                body, raw = self.install_streaming_body(data)
+                self.assert_remote(reason)
+                self.assertTrue(raw.closed)
+                self.assertEqual(body.close_calls, 1)
+                self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_actual_stream_close_failure_does_not_replace_primary_error(self):
+        class CloseFailingRaw(io.BytesIO):
+            def close(self):
+                super().close()
+                raise PermissionError("PRIVATE RAW STREAM PATH")
+        body, raw = self.install_streaming_body(b"x" * len(CIPHERTEXT), raw=CloseFailingRaw(b"x" * len(CIPHERTEXT)))
+        error = self.assert_remote("hash_mismatch")
+        self.assertTrue(error.cleanup_failed)
+        self.assertTrue(raw.closed)
+        self.assertEqual(body.close_calls, 1)
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_post_get_deadline_close_failure_preserves_timeout(self):
+        self.upload()
+        elapsed = [0.0]
+        class CloseFailingRaw(io.BytesIO):
+            def close(self):
+                super().close()
+                raise PermissionError("PRIVATE RAW STREAM PATH")
+        body, raw = self.install_streaming_body(raw=CloseFailingRaw(CIPHERTEXT),
+                                                advance=lambda: elapsed.__setitem__(0, 61))
+        destination = self.path.parent / "restored.age"
+        with patch("src.becoming_backup_transport.time.monotonic", side_effect=lambda: elapsed[0]):
+            error = self.assert_category("timeout", lambda: self.transport.download_for_restore(key_for(), destination))
+        self.assertTrue(error.cleanup_failed)
+        self.assertTrue(raw.closed)
+        self.assertEqual(body.close_calls, 1)
+        self.assertFalse(destination.exists())
+
+    def test_actual_stream_close_failure_after_good_download_is_unverified(self):
+        class CloseFailingRaw(io.BytesIO):
+            def close(self):
+                super().close()
+                raise PermissionError("PRIVATE RAW STREAM PATH")
+        body, raw = self.install_streaming_body(raw=CloseFailingRaw(CIPHERTEXT))
+        error = self.assert_remote("verification_cleanup_failure")
+        self.assertTrue(error.cleanup_failed)
+        self.assertTrue(raw.closed)
+        self.assertEqual(body.close_calls, 1)
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_pending_cleanup_failure_is_bounded_and_completed_destination_removed(self):
+        body, raw = self.install_streaming_body()
+        ordinary = Path.unlink
+
+        def fail_pending(path, *args, **kwargs):
+            if path.suffix == ".pending":
+                raise PermissionError("PRIVATE PENDING PATH")
+            return ordinary(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", fail_pending):
+            error = self.assert_remote("verification_cleanup_failure")
+        self.assertTrue(error.cleanup_failed)
+        self.assertTrue(raw.closed)
+        self.assertEqual(body.close_calls, 1)
+        leftovers = list(self.path.parent.rglob("*"))
+        self.assertFalse(any(path.name == "verified.tar.age" for path in leftovers))
+        self.assertTrue(any(path.suffix == ".pending" for path in leftovers))
+        # The injected permission fault is gone; test teardown owns repair.
+
+    def test_cleanup_failure_preserves_primary_download_hash_reason(self):
+        self.install_streaming_body(b"x" * len(CIPHERTEXT))
+        ordinary = Path.unlink
+
+        def fail_pending(path, *args, **kwargs):
+            if path.suffix == ".pending":
+                raise PermissionError("PRIVATE PENDING PATH")
+            return ordinary(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", fail_pending):
+            error = self.assert_remote("hash_mismatch")
+        self.assertTrue(error.cleanup_failed)
+        self.assertFalse(any(path.name == "verified.tar.age" for path in self.path.parent.rglob("*")))
+
+    def test_fdopen_failure_closes_descriptor_and_actual_response(self):
+        body, raw = self.install_streaming_body()
+        ordinary_close = os.close
+        closed = []
+
+        def close_descriptor(descriptor):
+            closed.append(descriptor)
+            return ordinary_close(descriptor)
+
+        with patch("src.becoming_backup_transport.os.fdopen", side_effect=PermissionError("PRIVATE FD PATH")), patch("src.becoming_backup_transport.os.close", side_effect=close_descriptor):
+            self.assert_remote("download_failure")
+        self.assertTrue(raw.closed)
+        self.assertEqual(body.close_calls, 1)
+        self.assertEqual(len(closed), 1)
+        with self.assertRaises(OSError):
+            os.fstat(closed[0])
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_final_verification_cleanup_failure_is_never_success(self):
+        ordinary = Path.unlink
+
+        def fail_verified(path, *args, **kwargs):
+            if path.name == "verified.tar.age":
+                raise PermissionError("PRIVATE VERIFIED PATH")
+            return ordinary(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", fail_verified):
+            error = self.assert_remote("verification_cleanup_failure")
+        self.assertTrue(error.cleanup_failed)
+        self.assertIn(key_for(), self.fake.objects)
+        self.assertTrue(any(path.name == "verified.tar.age" for path in self.path.parent.rglob("*")))
+        self.assertFalse(any(method.startswith("delete") for method, _ in self.fake.calls))
+
+    def test_cleanup_overrun_after_successful_verification_is_unverified_timeout(self):
+        elapsed = [0.0]
+        ordinary = Path.rmdir
+
+        def slow_cleanup(path, *args, **kwargs):
+            result = ordinary(path, *args, **kwargs)
+            elapsed[0] = 61
+            return result
+
+        with patch("src.becoming_backup_transport.time.monotonic", side_effect=lambda: elapsed[0]), patch.object(Path, "rmdir", slow_cleanup):
+            self.assert_remote("verification_timeout")
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_pre_put_failures_do_not_claim_remote_object(self):
+        self.fake.fail = "put_object"
+        error = self.assert_category("storage_unavailable", self.upload)
+        self.assertFalse(error.remote_uploaded)
+        self.assertIsNone(error.verification_reason)
+        self.assertFalse(self.fake.objects)
+
+    def test_post_put_failure_for_each_tier_leaves_independent_other_tiers_usable(self):
+        for tier in TIER_DAYS:
+            with self.subTest(tier=tier):
+                self.fake.head_changes = {"ContentLength": 1}
+                error = self.assert_remote("length_mismatch", lambda: self.upload(tier))
+                self.assertTrue(error.remote_uploaded)
+                self.assertIn(key_for(tier), self.fake.objects)
+                self.fake.head_changes = {}
+                sibling = "weekly" if tier != "weekly" else "daily"
+                self.assertTrue(self.upload(sibling)["download_verified"])
 
 
 class ReferenceAgeInteroperabilityTests(unittest.TestCase):

@@ -168,7 +168,10 @@ class BackupCommandTests(unittest.IsolatedAsyncioTestCase):
         poisoned = {key: PRIVATE for key in status()}
         poisoned.update(entry_content=PRIVATE, credentials=PRIVATE, endpoint=PRIVATE,
                         object_key=PRIVATE, age_identity=PRIVATE,
-                        successful_tiers=[PRIVATE, "daily"], failed_tiers={PRIVATE: PRIVATE, "weekly": PRIVATE})
+                        successful_tiers=[PRIVATE, "daily"], failed_tiers={PRIVATE: PRIVATE, "weekly": PRIVATE},
+                        tier_results={"daily": {"outcome": PRIVATE, "reason": PRIVATE},
+                                      "weekly": {"outcome": "remote_unverified", "reason": PRIVATE,
+                                                 "object_key": PRIVATE}})
         self.manager.status.return_value = poisoned
         interaction = Interaction()
         await self.callbacks.becoming_backup_status(interaction)
@@ -176,6 +179,23 @@ class BackupCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(len(text), 1000)
         self.assertIn("Successful tiers: daily", text)
         self.assertIn("Failed tiers: weekly", text)
+        self.assert_private(interaction)
+
+    async def test_status_privately_distinguishes_verified_unverified_and_unconfirmed_tiers(self):
+        report = status(category="partial_success", failures=1)
+        report.update(successful_tiers=["daily"], failed_tiers=["weekly", "monthly"], cleanup_failed=True,
+                      tier_results={"daily": {"outcome": "verified"},
+                                    "weekly": {"outcome": "remote_unverified", "reason": "hash_mismatch"},
+                                    "monthly": {"outcome": "not_uploaded", "reason": "storage_unavailable"}})
+        self.manager.status.return_value = report
+        interaction = Interaction()
+        await self.callbacks.becoming_backup_status(interaction)
+        text = interaction.sent()[0].args[0]
+        self.assertIn("daily: verified", text)
+        self.assertIn("weekly: remote_unverified (hash_mismatch)", text)
+        self.assertIn("monthly: not_uploaded (storage_unavailable)", text)
+        self.assertIn("Cleanup failed: yes", text)
+        self.assertLess(len(text), 1500)
         self.assert_private(interaction)
 
     async def test_errors_and_failed_defer_never_escape_or_send_public_fallback(self):

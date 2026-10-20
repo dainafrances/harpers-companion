@@ -62,7 +62,11 @@ database remains outside this subsystem and has **no verified recovery path**.
 Weekly/monthly tiers reuse the same verified snapshot as that day's daily
 object; every tier receives a separate upload and independent verification.
 There is no environment override to shorten these minima. Retain-until dates
-include the actual upload time, so a delayed transfer cannot weaken retention.
+are finalized immediately before PUT, after local hashing and readiness. Each
+adds the entire configured operation-timeout budget as a conservative transfer
+margin. Retention is checked again against the full tier minimum at the current
+verification time, including after verification cleanup. A delayed within-budget
+transfer therefore cannot shorten a verified recovery point's minimum retention.
 
 For the default root prefix, the B2 Native API `lifecycleRules` value is:
 
@@ -108,6 +112,12 @@ Populate only through a separately authorized private configuration release:
 
 No configuration values belong in operational responses. Invalid or partial
 configuration must fail before database, provider or object-store access.
+When backup is disabled, only the enablement and required-for-Room Boolean gates
+are parsed. Saved recipient, credentials and other optional settings are ignored
+and discarded, including malformed saved settings. The backup path performs no
+optional SDK/native import, recipient parsing, client creation or storage work.
+Required-for-Room still blocks executable Room operations when backup is disabled;
+the explicit `false` exemption preserves Room operation without starting backup.
 Ordinary chat, journal, status, Paintbox and continuity keep their own startup
 paths. Backup startup is isolated and occurs after their timers. The scheduler
 starts once per process despite reconnects, retries on later dates after
@@ -132,7 +142,16 @@ No title, content, reason, identity or route appears in keys or public metadata.
 
 Pyrage 1.4.0 provides buffered streaming encryption. The plaintext ceiling still
 applies. Ciphertext publication is atomic; plaintext and partial files are
-removed on success and handled failure. The Room write lock is released before
+cleaned independently on success and handled failure. Storage and backup locks
+are released through unconditional outer cleanup, even if connection close,
+rollback or unlink fails. An original bounded failure remains primary, with
+`cleanup_failed=true` recording secondary cleanup trouble. Cleanup failure alone
+is `cleanup_failure`; it never becomes success or permits uncertain plaintext
+capture to proceed to encryption/upload. Independently removable files are still
+removed. A file the operating system refuses to remove can remain in its private
+temporary directory; the failure is reported without its path or raw exception.
+This needs operator attention, rather than a false cleanup guarantee. The Room
+write lock is released before
 remote transfer. Storage readiness checks only the configured bucket/prefix.
 For an empty prefix, preflight cannot prove permissions to read a nonexistent
 object: the first actual encrypted upload must also pass HEAD, explicit
@@ -145,6 +164,15 @@ The upload's version identifier scopes verification where supplied. There are
 no delete, bypass-governance, or bucket-administration calls. An uploaded object
 whose verification fails can remain locked remotely; report failure and leave
 its expiry to lifecycle rules. Never request deletion privileges to clean it up.
+No multipart upload is used. Every tier whose PUT completed but whose subsequent
+inspection, download, hash or verification cleanup failed is
+`remote_unverified`, with a bounded reason such as `retention_too_short`,
+`hash_mismatch` or `verification_cleanup_failure`. Its recovery point is not
+accepted and it never advances `last_successful_time`. Verified sibling tiers
+remain verified. A retry uses a fresh backup/object ID. Before a confirmed PUT,
+the ordinary bounded failure category is retained; `not_uploaded` means no
+successful PUT was confirmed, not proof that a timed-out remote request left
+nothing behind.
 
 Capture/encryption/hash loops check the deadline cooperatively. SDK connection
 and blocking read calls have separate limits of at most 10 and 30 seconds;
@@ -153,9 +181,26 @@ chunk. Cancellation waits
 for the active worker's bounded call and cleanup before releasing the backup
 lock. It does not leave a detached upload running behind a returned result.
 
-The local status document holds bounded operational fields only. It is neither
-memory nor model context. Partial multi-tier results identify each successful
-and failed tier. Scheduled failures alert only through the exact private Room
+The local status document holds bounded operational fields only. It requires
+`application="room-of-becoming-backup-status"` and integer `format_version=1`.
+Only a strictly validated owned document may be replaced. Unrelated, malformed,
+ambiguous, unowned or future-version JSON is preserved and rejected, including
+known/default/configured companion persistence files and their aliases. An old
+unowned backup-status file is not adopted or migrated; separately authorize its
+archival/removal before activation. Missing status is created privately and
+atomically. Existing owned status is replaced atomically after rechecking its
+filesystem identity, ownership, size and modification/change timestamps.
+Ordinary target replacement or mutation is detected. A separate hostile process
+with arbitrary volume write access can still race the final check and rename;
+that case is outside this single-service filesystem boundary.
+
+Status is neither memory nor model context. `tier_results` distinguishes
+`verified`, `not_uploaded` and `remote_unverified`, retaining only bounded failure
+reasons and cleanup flags. Partial multi-tier results identify each successful
+and failed tier; a partial or unverified run does not advance the last successful
+time. For example, an operational status can describe a verified daily tier and
+an unverified weekly tier with reason `hash_mismatch`, without any entry text,
+object key or secret. Scheduled failures alert only through the exact private Room
 route, with time/category/failure count. Routine success is silent; the first
 fully verified success after process startup produces one private confirmation.
 The owner can invoke `/becoming_backup_now` for the manual tier or

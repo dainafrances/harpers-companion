@@ -18,7 +18,7 @@ import discord
 from discord import app_commands
 
 from .becoming import RoomConfig
-from .becoming_backup import BACKUP_CATEGORIES, BackupError
+from .becoming_backup import BACKUP_CATEGORIES, VERIFICATION_REASONS, BackupError
 from .becoming_commands import _private_message, _scope, sync_room_commands
 
 
@@ -64,6 +64,19 @@ def format_status(status: object) -> str:
     commit = commit if isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit) else "unavailable"
     size = status.get("ciphertext_size")
     size = size if isinstance(size, int) and not isinstance(size, bool) and 0 <= size <= 2**40 else 0
+    tiers = status.get("tier_results")
+    tiers = tiers if isinstance(tiers, dict) else {}
+    tier_lines = []
+    for tier in _TIERS:
+        detail = tiers.get(tier)
+        if not isinstance(detail, dict):
+            continue
+        outcome = detail.get("outcome")
+        if not isinstance(outcome, str) or outcome not in {"verified", "not_uploaded", "remote_unverified"}:
+            continue
+        reason = detail.get("reason")
+        reason = reason if isinstance(reason, str) and reason in BACKUP_CATEGORIES | VERIFICATION_REASONS else None
+        tier_lines.append(f"{tier}: {outcome}" + (f" ({reason})" if reason else ""))
     return "\n".join((
         "Room backup operations",
         f"Outcome: {_category(status.get('outcome_category'))}",
@@ -72,6 +85,8 @@ def format_status(status: object) -> str:
         f"Backup ID: {identifier}",
         "Successful tiers: " + (", ".join(tier for tier in _TIERS if tier in successful) or "none"),
         "Failed tiers: " + (", ".join(tier for tier in _TIERS if tier in failed) or "none"),
+        "Tier results: " + ("; ".join(tier_lines) or "none"),
+        "Cleanup failed: " + ("yes" if status.get("cleanup_failed") is True else "no"),
         f"Ciphertext bytes: {size}",
         f"Schema version: {_count(status.get('schema_version'))}",
         f"Code commit: {commit}",

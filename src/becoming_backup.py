@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time, timezone
 import hashlib
 import json
 import os
@@ -42,13 +41,24 @@ _CATEGORIES = frozenset({
     "decrypt_failed", "archive_invalid", "manifest_mismatch", "database_hash_mismatch",
     "recovery_verification_failed", "restore_io_failure", "object_metadata_invalid",
     "synthetic_only_required", "partial_success", "success", "not_run",
+    "cleanup_failure", "remote_unverified", "retention_too_short",
 })
 BACKUP_CATEGORIES = _CATEGORIES
+VERIFICATION_REASONS = frozenset({
+    "metadata_mismatch", "retention_mismatch", "retention_too_short",
+    "download_timeout", "download_failure", "length_mismatch", "hash_mismatch",
+    "verification_timeout", "verification_cleanup_failure", "cancelled",
+    "storage_unavailable",
+})
 
 
 class BackupError(RuntimeError):
-    def __init__(self, category: str):
-        self.category = category if category in _CATEGORIES else "internal_failure"
+    def __init__(self, category: str, *, cleanup_failed: bool = False,
+                 verification_reason: str | None = None, remote_uploaded: bool = False):
+        self.category = category if isinstance(category, str) and category in _CATEGORIES else "internal_failure"
+        self.cleanup_failed = cleanup_failed is True
+        self.verification_reason = verification_reason if isinstance(verification_reason, str) and verification_reason in VERIFICATION_REASONS else None
+        self.remote_uploaded = remote_uploaded is True
         super().__init__(self.category)
 
 
@@ -73,10 +83,20 @@ def _canonical(value: object) -> bytes:
 
 def file_sha256(path: str | Path, *, deadline=None, cancel=None) -> str:
     digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
+    stream = None
+    primary = None
+    try:
+        stream = Path(path).open("rb")
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             _check(deadline, cancel)
             digest.update(block)
+    except BaseException as error:
+        primary = _bounded_error(error, "capture_failed")
+    finally:
+        primary = _cleanup([stream.close] if stream is not None else [], primary,
+                           deadline=deadline, cancel=cancel)
+    if primary is not None:
+        raise primary from None
     return digest.hexdigest()
 
 
@@ -99,25 +119,14 @@ def _bool(raw: str, default: bool) -> bool:
     return raw == "true"
 
 
-def _safe_status_path(path: Path, database: Path) -> bool:
+def _safe_status_path(path: Path, database: Path, *, protected_paths=(), env=None) -> bool:
     try:
-        if ".." in path.parts or path.is_symlink():
+        from . import becoming_backup_status as status_document
+        if not status_document.safe_path(path, database, protected_paths=protected_paths, env=env):
             return False
-        target, database = path.absolute().resolve(), database.absolute().resolve()
-        if target.parent != database.parent or target.suffix != ".json":
-            return False
-        if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,100}", target.name):
-            return False
-        if target.exists() and (not target.is_file() or target.stat().st_nlink != 1):
-            return False
-        if any(target == Path(str(database) + suffix) for suffix in ("", "-wal", "-shm", "-journal")):
-            return False
-        root = becoming.REPOSITORY_ROOT.resolve()
-        identity = becoming._filesystem_identity(root)
-        becoming._private_repository_route(path.absolute(), root, identity)
-        becoming._private_repository_route(target, root, identity)
+        status_document.inspect(Path(path), _CATEGORIES, globals().get("VERIFICATION_REASONS", ()))
         return True
-    except (OSError, RuntimeError, ValueError, becoming.RoomError):
+    except (OSError, RuntimeError, ValueError, TypeError, becoming.RoomError):
         return False
 
 
@@ -157,6 +166,11 @@ class BackupConfig:
             get = lambda name, default="": env.get("BECOMING_BACKUP_" + name, default).strip()
             values["required_for_room"] = _bool(get("REQUIRED_FOR_ROOM"), True)
             values["enabled"] = _bool(get("ENABLED"), False)
+            if not values["enabled"]:
+                # Saved optional settings are deliberately neither read nor
+                # validated while disabled, including native age imports.
+                return cls(required_for_room=values["required_for_room"],
+                           db_path=database, status_path=database.parent / "backup-status.json")
             clock = get("TIME_UTC", "03:00")
             if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", clock):
                 raise ValueError
@@ -195,7 +209,7 @@ class BackupConfig:
             values["prefix"] = prefix
             if get("STATUS_PATH"):
                 values["status_path"] = Path(get("STATUS_PATH"))
-            if not _safe_status_path(values["status_path"], database):
+            if not _safe_status_path(values["status_path"], database, env=env):
                 raise ValueError
             return cls(**values, valid=True)
         except Exception:
@@ -212,6 +226,65 @@ def _check(deadline: float | None = None, cancel: threading.Event | None = None)
         raise BackupError("cancelled")
     if deadline is not None and monotonic_time.monotonic() >= deadline:
         raise BackupError("timeout")
+
+
+def _bounded_error(error: BaseException, default: str) -> BackupError:
+    """Copy bounded attributes only; retain no OS/provider exception object."""
+    if isinstance(error, BackupError):
+        return BackupError(error.category, cleanup_failed=error.cleanup_failed,
+                           verification_reason=error.verification_reason,
+                           remote_uploaded=error.remote_uploaded)
+    if isinstance(error, (KeyboardInterrupt, asyncio.CancelledError, SystemExit)):
+        return BackupError("cancelled")
+    return BackupError(default)
+
+
+def _cleanup(actions, primary: BackupError | None = None, *, deadline=None, cancel=None) -> BackupError | None:
+    """Attempt every action even after failures, cancellation or timeout."""
+    failed = False
+    for action in actions:
+        try:
+            _check(deadline, cancel)
+        except BackupError as error:
+            if primary is None:
+                primary = _bounded_error(error, "cleanup_failure")
+        try:
+            action()
+        except BaseException as error:
+            failed = True
+            if primary is None:
+                primary = _bounded_error(error, "cleanup_failure")
+    try:
+        _check(deadline, cancel)
+    except BackupError as error:
+        if primary is None:
+            primary = _bounded_error(error, "cleanup_failure")
+    if failed:
+        primary = primary or BackupError("cleanup_failure")
+        primary.cleanup_failed = True
+    return primary
+
+
+def _remove_private_tree(directory: Path) -> None:
+    """Remove each disposable member independently, without an error finalizer."""
+    actions = []
+    scan_failed = False
+    def onerror(_):
+        nonlocal scan_failed
+        scan_failed = True
+    for parent, directories, files in os.walk(directory, topdown=False, onerror=onerror, followlinks=False):
+        for name in files:
+            actions.append(lambda path=Path(parent) / name: path.unlink(missing_ok=True))
+        for name in directories:
+            path = Path(parent) / name
+            actions.append(lambda path=path: path.unlink(missing_ok=True) if path.is_symlink() else path.rmdir())
+    actions.append(lambda: directory.rmdir() if directory.exists() else None)
+    primary = _cleanup(actions)
+    if scan_failed:
+        primary = primary or BackupError("cleanup_failure")
+        primary.cleanup_failed = True
+    if primary is not None:
+        raise primary from None
 
 
 def _sql_manifest(conn: sqlite3.Connection, deadline=None, cancel=None) -> tuple[str, dict, dict]:
@@ -239,7 +312,7 @@ def _sql_manifest(conn: sqlite3.Connection, deadline=None, cancel=None) -> tuple
     return digest.hexdigest(), counts, revisions
 
 
-def _immutability(conn: sqlite3.Connection) -> None:
+def _immutability(conn: sqlite3.Connection, *, deadline=None, cancel=None) -> None:
     for table, sql, expected in (
         ("revisions", "UPDATE revisions SET title=title", "immutable_revision"),
         ("revisions", "DELETE FROM revisions", "immutable_revision"),
@@ -250,6 +323,7 @@ def _immutability(conn: sqlite3.Connection) -> None:
         if conn.execute(f"SELECT 1 FROM {table}{condition} LIMIT 1").fetchone() is None:
             continue  # Exact schema fingerprint still verifies empty-table guards.
         conn.execute("BEGIN IMMEDIATE")
+        primary = None
         try:
             try:
                 conn.execute(sql)
@@ -258,8 +332,18 @@ def _immutability(conn: sqlite3.Connection) -> None:
                     raise BackupError("immutability_failure") from None
             else:
                 raise BackupError("immutability_failure")
+        except BaseException as error:
+            primary = _bounded_error(error, "immutability_failure")
+            if not isinstance(error, BackupError):
+                try:
+                    _check(deadline, cancel)
+                except BackupError as interrupted:
+                    primary = _bounded_error(interrupted, "immutability_failure")
         finally:
-            conn.execute("ROLLBACK")
+            primary = _cleanup([lambda: conn.execute("ROLLBACK")], primary,
+                               deadline=deadline, cancel=cancel)
+        if primary is not None:
+            raise primary from None
 
 
 def validate_database(path: str | Path, *, immutable: bool = True, deadline=None, cancel=None) -> dict:
@@ -267,6 +351,8 @@ def validate_database(path: str | Path, *, immutable: bool = True, deadline=None
     if not path.is_file() or path.is_symlink():
         raise BackupError("source_missing")
     connection = None
+    primary = None
+    result = None
     try:
         connection = sqlite3.connect(path.absolute().as_uri() + "?mode=rw", uri=True, isolation_level=None, timeout=5)
         connection.set_progress_handler(lambda: int((cancel is not None and cancel.is_set()) or (deadline is not None and monotonic_time.monotonic() >= deadline)), 1000)
@@ -281,23 +367,28 @@ def validate_database(path: str | Path, *, immutable: bool = True, deadline=None
         _check(deadline, cancel)
         before, counts, revisions = _sql_manifest(connection, deadline, cancel)
         if immutable:
-            _immutability(connection)
+            _immutability(connection, deadline=deadline, cancel=cancel)
             after, _, _ = _sql_manifest(connection, deadline, cancel)
             if before != after:
                 raise BackupError("immutability_failure")
         mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
-        return {"application_id": becoming.APPLICATION_ID, "schema_version": becoming.SCHEMA_VERSION,
+        result = {"application_id": becoming.APPLICATION_ID, "schema_version": becoming.SCHEMA_VERSION,
                 "database_size": path.stat().st_size, "database_sha256": file_sha256(path, deadline=deadline, cancel=cancel),
                 "sql_manifest_digest": before, "row_counts": counts,
                 "revision_count_summary": revisions, "source_journal_mode": mode}
-    except sqlite3.Error:
-        _check(deadline, cancel)
-        raise BackupError("integrity_failure") from None
-    except OSError:
-        raise BackupError("capture_failed") from None
+    except BaseException as error:
+        primary = _bounded_error(error, "integrity_failure" if isinstance(error, sqlite3.Error) else "capture_failed")
+        if isinstance(error, sqlite3.Error):
+            try:
+                _check(deadline, cancel)
+            except BackupError as interrupted:
+                primary = _bounded_error(interrupted, "integrity_failure")
     finally:
-        if connection is not None:
-            connection.close()
+        primary = _cleanup([connection.close] if connection is not None else [], primary,
+                           deadline=deadline, cancel=cancel)
+    if primary is not None:
+        raise primary from None
+    return result
 
 
 def _bundle_state(path: Path, *, deadline=None, cancel=None, limit=None) -> dict:
@@ -314,7 +405,13 @@ def _bundle_state(path: Path, *, deadline=None, cancel=None, limit=None) -> dict
 
 def _private_file(path: Path):
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    return os.fdopen(descriptor, "wb")
+    primary = None
+    try:
+        return os.fdopen(descriptor, "wb")
+    except BaseException as error:
+        primary = _bounded_error(error, "capture_failed")
+    primary = _cleanup([lambda: os.close(descriptor)], primary)
+    raise primary from None
 
 
 def _temp_parent(database: Path) -> Path:
@@ -480,6 +577,8 @@ def capture_bundle(store: becoming.RoomStore, destination_dir: str | Path, confi
         raise BackupError("invalid_configuration")
     acquired = False
     connection = dest = None
+    primary = None
+    result = None
     try:
         _check(deadline, cancel)
         wait = max(0.0, deadline - monotonic_time.monotonic()) if deadline else config.timeout_seconds
@@ -521,12 +620,8 @@ def capture_bundle(store: becoming.RoomStore, destination_dir: str | Path, confi
             pass
         dest = sqlite3.connect(backup, isolation_level=None)
         connection.backup(dest, pages=64, progress=lambda *_: _check(deadline, cancel), sleep=0.0)
-        dest.close(); dest = None
-        connection.close(); connection = None
-        dest = sqlite3.connect(backup, isolation_level=None)
         if dest.execute("PRAGMA journal_mode=DELETE").fetchone()[0] != "delete":
             raise BackupError("capture_failed")
-        dest.close(); dest = None
         info = validate_database(backup, deadline=deadline, cancel=cancel)
         if info["sql_manifest_digest"] != original_digest:
             raise BackupError("source_changed")
@@ -550,23 +645,30 @@ def capture_bundle(store: becoming.RoomStore, destination_dir: str | Path, confi
         if _bundle_state(database, deadline=deadline, cancel=cancel, limit=config.max_plaintext_bytes) != before:
             raise BackupError("source_changed")
         _check(deadline, cancel)
-        return CaptureResult(archive_path, manifest)
-    except BackupError:
-        if archive_path.exists(): archive_path.unlink()
-        raise
-    except (sqlite3.Error, OSError, becoming.RoomError):
-        if archive_path.exists(): archive_path.unlink()
-        _check(deadline, cancel)
-        raise BackupError("capture_failed") from None
+        result = CaptureResult(archive_path, manifest)
+    except BaseException as error:
+        primary = _bounded_error(error, "capture_failed")
+        if primary.category == "capture_failed":
+            try:
+                _check(deadline, cancel)
+            except BackupError as interrupted:
+                primary = _bounded_error(interrupted, "capture_failed")
     finally:
-        if dest is not None: dest.close()
-        if connection is not None: connection.close()
-        for base in (source_copy, backup):
-            for suffix in ("", "-wal", "-shm", "-journal"):
-                file = Path(str(base) + suffix)
-                if file.exists(): file.unlink()
-        if acquired:
-            becoming._STORAGE_LOCK.release()
+        try:
+            actions = [item.close for item in (dest, connection) if item is not None]
+            actions.extend((lambda path=Path(str(base) + suffix): path.unlink(missing_ok=True))
+                           for base in (source_copy, backup) for suffix in ("", "-wal", "-shm", "-journal"))
+            primary = _cleanup(actions, primary, deadline=deadline, cancel=cancel)
+            if primary is not None:
+                primary = _cleanup([lambda: archive_path.unlink(missing_ok=True)], primary,
+                                   deadline=deadline, cancel=cancel)
+        finally:
+            # No connection/file cleanup failure can bypass this release.
+            if acquired:
+                becoming._STORAGE_LOCK.release()
+    if primary is not None:
+        raise primary from None
+    return result
 
 
 class _LimitedReader:
@@ -600,56 +702,52 @@ def encrypt_archive(path: str | Path, ciphertext_path: str | Path, recipient: st
     path, ciphertext_path = Path(path), Path(ciphertext_path)
     pending = ciphertext_path.with_name(".encrypt-" + uuid4().hex + ".pending")
     published = False
+    primary = None
+    source = target = None
+    result = None
     try:
         if ciphertext_path.exists() or ciphertext_path.is_symlink(): raise BackupError("destination_exists")
         if path.stat().st_size > max_plaintext_bytes: raise BackupError("plaintext_too_large")
         if not re.fullmatch(r"age1[0-9a-z]{58}", recipient): raise BackupError("invalid_configuration")
         import pyrage
         public = pyrage.x25519.Recipient.from_str(recipient)
-        with path.open("rb") as source, _private_file(pending) as target:
-            pyrage.encrypt_io(_LimitedReader(source, max_plaintext_bytes, deadline, cancel),
-                              _LimitedWriter(target, max_plaintext_bytes + 1048576, deadline, cancel), [public])
-            target.flush(); os.fsync(target.fileno())
-        _check(deadline, cancel)
-        digest, size = file_sha256(pending, deadline=deadline, cancel=cancel), pending.stat().st_size
-        _check(deadline, cancel)
-        os.link(pending, ciphertext_path)
-        published = True
-        pending.unlink()
-        return {"ciphertext_sha256": digest, "ciphertext_size": size}
-    except BackupError:
-        raise
+        source = path.open("rb")
+        target = _private_file(pending)
+        pyrage.encrypt_io(_LimitedReader(source, max_plaintext_bytes, deadline, cancel),
+                          _LimitedWriter(target, max_plaintext_bytes + 1048576, deadline, cancel), [public])
+        target.flush()
+        os.fsync(target.fileno())
     except BaseException as error:
-        if published and ciphertext_path.exists():
-            ciphertext_path.unlink()
-            published = False
-        if isinstance(error, (KeyboardInterrupt, asyncio.CancelledError)):
-            raise BackupError("cancelled") from None
-        raise BackupError("encryption_failed") from None
+        primary = _bounded_error(error, "encryption_failed")
     finally:
-        if pending.exists(): pending.unlink()
-        if not published and ciphertext_path.exists():
-            # Existing destinations were rejected before any write.
-            pass
+        primary = _cleanup([item.close for item in (target, source) if item is not None],
+                           primary, deadline=deadline, cancel=cancel)
+    if primary is None:
+        try:
+            digest = file_sha256(pending, deadline=deadline, cancel=cancel)
+            size = pending.stat().st_size
+            _check(deadline, cancel)
+            os.link(pending, ciphertext_path)
+            published = True
+            result = {"ciphertext_sha256": digest, "ciphertext_size": size}
+        except BaseException as error:
+            primary = _bounded_error(error, "encryption_failed")
+    primary = _cleanup([lambda: pending.unlink(missing_ok=True)], primary,
+                       deadline=deadline, cancel=cancel)
+    if primary is not None:
+        if published:
+            primary = _cleanup([lambda: ciphertext_path.unlink(missing_ok=True)], primary,
+                               deadline=deadline, cancel=cancel)
+        raise primary from None
+    return result
 
 
 def _safe_status(value: object) -> dict:
-    if not isinstance(value, dict): return {}
-    output = {}
-    for key in ("last_attempt_time", "last_successful_time"):
-        raw = value.get(key)
-        if isinstance(raw, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", raw): output[key] = raw
-    if isinstance(value.get("backup_id"), str) and re.fullmatch(r"[0-9a-f]{32}", value["backup_id"]): output["backup_id"] = value["backup_id"]
-    for key in ("successful_tiers", "failed_tiers"):
-        if isinstance(value.get(key), list): output[key] = sorted(set(x for x in value[key] if isinstance(x, str) and x in RETENTION_DAYS))
-    for key in ("ciphertext_size", "consecutive_failure_count", "schema_version"):
-        raw = value.get(key)
-        if type(raw) is int and 0 <= raw <= 1000000000: output[key] = raw
-    for key in ("retention_verified", "download_verified"):
-        if type(value.get(key)) is bool: output[key] = value[key]
-    if isinstance(value.get("outcome_category"), str) and value["outcome_category"] in _CATEGORIES: output["outcome_category"] = value["outcome_category"]
-    if commit := _commit(value.get("code_commit")): output["code_commit"] = commit
-    return output
+    from . import becoming_backup_status as status_document
+    try:
+        return status_document.owned(value, _CATEGORIES, globals().get("VERIFICATION_REASONS", ()))
+    except (ValueError, TypeError):
+        return status_document.owned({"outcome_category": "status_unavailable"}, _CATEGORIES)
 
 
 class BackupManager:
@@ -665,31 +763,72 @@ class BackupManager:
 
     def status(self) -> dict:
         if not self.config.can_run: return {"outcome_category": "invalid_configuration"}
-        if self._status: return _safe_status(self._status)
         try:
+            from . import becoming_backup_status as status_document
             path = self.config.status_path
-            if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_STATUS_BYTES: return {}
-            self._status = _safe_status(json.loads(path.read_bytes()))
-        except (OSError, ValueError, TypeError):
-            return {"outcome_category": "status_unavailable"}
+            if not _safe_status_path(path, self.store.path, protected_paths=self.store.protected_paths):
+                raise ValueError
+            document, _ = status_document.inspect(path, _CATEGORIES, globals().get("VERIFICATION_REASONS", ()))
+            if document is None:
+                return _safe_status(self._status) if self._status else {}
+            self._status = document
+        except (OSError, ValueError, TypeError, RuntimeError):
+            return _safe_status({"outcome_category": "status_unavailable"})
         return _safe_status(self._status)
 
     def _record(self, value: dict) -> dict:
+        from . import becoming_backup_status as status_document
+        previous_success = self._status.get("last_successful_time")
         safe = _safe_status(value)
         self._status = safe
         path = self.config.status_path
         pending = path.with_name(".backup-status-" + uuid4().hex + ".pending")
+        primary = None
+        stream = None
         try:
-            if not _safe_status_path(path, self.store.path) or not path.parent.is_dir(): raise BackupError("status_unavailable")
-            with _private_file(pending) as stream:
-                stream.write(_canonical(safe)); stream.flush(); os.fsync(stream.fileno())
-            os.replace(pending, path)
-        except (OSError, BackupError):
-            safe = {**safe, "outcome_category": "status_unavailable"}
-            self._status = safe
+            if (not _safe_status_path(path, self.store.path, protected_paths=self.store.protected_paths)
+                    or not path.parent.is_dir()):
+                raise BackupError("status_unavailable")
+            _, expected_identity = status_document.inspect(path, _CATEGORIES, globals().get("VERIFICATION_REASONS", ()))
+            stream = _private_file(pending)
+            stream.write(_canonical(safe)); stream.flush(); os.fsync(stream.fileno())
+        except BaseException as error:
+            primary = _bounded_error(error, "status_unavailable")
         finally:
-            if pending.exists(): pending.unlink()
-        return _safe_status(safe)
+            primary = _cleanup([stream.close] if stream is not None else [], primary)
+        try:
+            # Recheck ownership and inode/size/timestamps after writing the
+            # private pending file. A separate hostile filesystem writer could
+            # still race this check and rename; normal single-service mutation
+            # is detected and never silently adopted.
+            if primary is None:
+                if not _safe_status_path(path, self.store.path, protected_paths=self.store.protected_paths):
+                    raise BackupError("status_unavailable")
+                _, current_identity = status_document.inspect(path, _CATEGORIES, globals().get("VERIFICATION_REASONS", ()))
+                if current_identity != expected_identity:
+                    raise BackupError("status_unavailable")
+                os.replace(pending, path)
+        except BaseException as error:
+            primary = _bounded_error(error, "status_unavailable")
+        finally:
+            primary = _cleanup(
+                (lambda: pending.unlink() if pending.exists() else None,),
+                primary,
+            )
+            if primary is not None and primary.cleanup_failed:
+                safe["cleanup_failed"] = True
+        if primary:
+            # Keep an existing work failure as the primary category, but never
+            # turn a status-write or cleanup failure into backup success.
+            if safe["outcome_category"] in {"success", "partial_success", "not_run"}:
+                if safe["outcome_category"] == "success":
+                    if previous_success:
+                        safe["last_successful_time"] = previous_success
+                    else:
+                        safe.pop("last_successful_time", None)
+                safe["outcome_category"] = primary.category
+        self._status = _safe_status(safe)
+        return _safe_status(self._status)
 
     async def run(self, tiers=("manual",), now: datetime | None = None) -> dict:
         if not self.config.can_run: raise BackupError("invalid_configuration")
@@ -713,59 +852,93 @@ class BackupManager:
             raise
 
     def _run(self, tiers, now, cancel):
-        deadline = monotonic_time.monotonic() + self.config.timeout_seconds
-        previous = self.status()
-        identifier = uuid4().hex
-        result = {"last_attempt_time": _stamp(now), "backup_id": identifier, "successful_tiers": [],
-                  "failed_tiers": list(tiers), "schema_version": becoming.SCHEMA_VERSION,
-                  "outcome_category": "internal_failure", "consecutive_failure_count": previous.get("consecutive_failure_count", 0) + 1,
-                  "retention_verified": False, "download_verified": False}
-        if previous.get("last_successful_time"): result["last_successful_time"] = previous["last_successful_time"]
-        if self.code_commit: result["code_commit"] = self.code_commit
         try:
-            parent = _temp_parent(self.store.path)
-            with tempfile.TemporaryDirectory(prefix="room-backup-", dir=parent) as temporary:
-                directory = Path(temporary); os.chmod(directory, 0o700)
-                capture = capture_bundle(self.store, directory, self.config, code_commit=self.code_commit,
-                                         now=now, backup_id=identifier, deadline=deadline, cancel=cancel)
-                ciphertext = directory / (identifier + ".tar.age")
-                encrypted = encrypt_archive(capture.archive_path, ciphertext, self.config.age_recipient,
-                                            self.config.max_plaintext_bytes, deadline=deadline, cancel=cancel)
-                capture.archive_path.unlink()
-                result["ciphertext_size"] = encrypted["ciphertext_size"]
-                transport = self.transport or B2Transport(self.config)
-                failures = []
-                for tier in tiers:
-                    try:
-                        _check(deadline, cancel)
-                        key = f"{self.config.prefix}/{tier}/{now:%Y/%m/%d}/{now:%Y%m%dT%H%M%SZ}-{identifier}.tar.age"
-                        metadata = {"backup_format_version": str(FORMAT_VERSION), "schema_version": str(becoming.SCHEMA_VERSION),
-                                    "backup_id": identifier, "tier": tier, "ciphertext_sha256": encrypted["ciphertext_sha256"]}
-                        if self.code_commit: metadata["code_commit"] = self.code_commit
-                        retain_until = max(now, _utc()) + timedelta(days=RETENTION_DAYS[tier], seconds=60)
-                        verified = transport.upload_and_verify(ciphertext, key=key, metadata=metadata, retain_until=retain_until, deadline=deadline)
-                        _check(deadline, cancel)
-                        if not verified.get("retention_verified") or not verified.get("download_verified"): raise BackupError("metadata_mismatch")
-                        result["successful_tiers"].append(tier)
-                        result["failed_tiers"].remove(tier)
-                    except BackupError as error:
-                        failures.append(error.category)
-                    except Exception:
-                        failures.append("storage_unavailable")
-                if not failures:
-                    result.update(outcome_category="success", consecutive_failure_count=0, last_successful_time=_stamp(now), retention_verified=True, download_verified=True)
-                else:
-                    result["outcome_category"] = "partial_success" if result["successful_tiers"] else failures[0]
-                    result["retention_verified"] = bool(result["successful_tiers"])
-                    result["download_verified"] = bool(result["successful_tiers"])
-        except BackupError as error:
-            result["outcome_category"] = error.category
-        except Exception:
-            result["outcome_category"] = "internal_failure"
+            return self._run_locked(tiers, now, cancel)
         finally:
-            try: result = self._record(result)
-            finally: _BACKUP_LOCK.release()
-        return result
+            _BACKUP_LOCK.release()
+
+    def _run_locked(self, tiers, now, cancel):
+        deadline = monotonic_time.monotonic() + self.config.timeout_seconds
+        identifier = uuid4().hex
+        result = {"last_attempt_time": _stamp(now), "backup_id": identifier,
+                  "successful_tiers": [], "failed_tiers": list(tiers), "tier_results": {},
+                  "schema_version": becoming.SCHEMA_VERSION, "outcome_category": "internal_failure",
+                  "consecutive_failure_count": 1, "retention_verified": False, "download_verified": False}
+        if self.code_commit:
+            result["code_commit"] = self.code_commit
+        directory = None
+        primary = None
+        try:
+            previous = self.status()
+            result["consecutive_failure_count"] = min(previous.get("consecutive_failure_count", 0) + 1, 1_000_000_000)
+            if previous.get("last_successful_time"):
+                result["last_successful_time"] = previous["last_successful_time"]
+            if previous.get("outcome_category") == "status_unavailable":
+                raise BackupError("status_unavailable")
+            parent = _temp_parent(self.store.path)
+            directory = Path(tempfile.mkdtemp(prefix="room-backup-", dir=parent))
+            os.chmod(directory, 0o700)
+            capture = capture_bundle(self.store, directory, self.config, code_commit=self.code_commit,
+                                     now=now, backup_id=identifier, deadline=deadline, cancel=cancel)
+            ciphertext = directory / (identifier + ".tar.age")
+            encrypted = encrypt_archive(capture.archive_path, ciphertext, self.config.age_recipient,
+                                        self.config.max_plaintext_bytes, deadline=deadline, cancel=cancel)
+            archive_error = _cleanup([lambda: capture.archive_path.unlink()], deadline=deadline, cancel=cancel)
+            if archive_error is not None:
+                raise archive_error from None
+            result["ciphertext_size"] = encrypted["ciphertext_size"]
+            transport = self.transport or B2Transport(self.config)
+            failures = []
+            for tier in tiers:
+                try:
+                    _check(deadline, cancel)
+                    key = f"{self.config.prefix}/{tier}/{now:%Y/%m/%d}/{now:%Y%m%dT%H%M%SZ}-{identifier}.tar.age"
+                    metadata = {"backup_format_version": str(FORMAT_VERSION), "schema_version": str(becoming.SCHEMA_VERSION),
+                                "backup_id": identifier, "tier": tier, "ciphertext_sha256": encrypted["ciphertext_sha256"]}
+                    if self.code_commit:
+                        metadata["code_commit"] = self.code_commit
+                    # This is only the capture-time lower bound. The transport
+                    # determines the retained deadline at the actual PUT.
+                    verified = transport.upload_and_verify(ciphertext, key=key, metadata=metadata,
+                                                           retain_until=now, deadline=deadline)
+                    if not verified.get("retention_verified") or not verified.get("download_verified"):
+                        raise BackupError("remote_unverified", verification_reason="metadata_mismatch", remote_uploaded=True)
+                    result["successful_tiers"].append(tier)
+                    result["failed_tiers"].remove(tier)
+                    result["tier_results"][tier] = {"outcome": "verified"}
+                except BaseException as error:
+                    bounded = _bounded_error(error, "storage_unavailable")
+                    if bounded.remote_uploaded and bounded.category != "remote_unverified":
+                        bounded = BackupError("remote_unverified", verification_reason="verification_timeout" if bounded.category == "timeout" else "storage_unavailable",
+                                              remote_uploaded=True, cleanup_failed=bounded.cleanup_failed)
+                    failures.append(bounded.category)
+                    remote = bounded.category == "remote_unverified"
+                    details = {"outcome": "remote_unverified" if remote else "not_uploaded",
+                               "reason": (bounded.verification_reason or "storage_unavailable") if remote else bounded.category}
+                    if bounded.cleanup_failed:
+                        details["cleanup_failed"] = True
+                        result["cleanup_failed"] = True
+                    result["tier_results"][tier] = details
+            result["outcome_category"] = ("partial_success" if result["successful_tiers"] else failures[0]) if failures else "success"
+            result["retention_verified"] = bool(result["successful_tiers"])
+            result["download_verified"] = bool(result["successful_tiers"])
+        except BaseException as error:
+            primary = _bounded_error(error, "internal_failure")
+        finally:
+            if primary is None and result["outcome_category"] != "success":
+                primary = BackupError(result["outcome_category"], cleanup_failed=result.get("cleanup_failed", False))
+            primary = _cleanup([lambda: _remove_private_tree(directory)] if directory is not None else [], primary,
+                               deadline=deadline, cancel=cancel)
+        if primary is not None:
+            result["outcome_category"] = primary.category
+            if primary.cleanup_failed:
+                result["cleanup_failed"] = True
+            for tier in tiers:
+                if tier not in result["tier_results"]:
+                    result["tier_results"][tier] = {"outcome": "not_uploaded", "reason": primary.category}
+        elif result["outcome_category"] == "success":
+            result.update(consecutive_failure_count=0, last_successful_time=_stamp(now))
+        return self._record(result)
 
 
 from .becoming_backup_transport import B2Transport
